@@ -22,6 +22,34 @@ use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, Env, String,
 };
 
+// ── Ballot state types ────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BallotState {
+    Active,
+    ResultPublished,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct BallotMetadata {
+    pub created_at: u64,
+    pub admin: Address,
+    pub state: BallotState,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct BallotStateSnapshot {
+    pub tokens_issued: u32,
+    pub votes_cast: u32,
+    pub result_hash: Option<String>,
+    pub created_at: u64,
+    pub admin: Address,
+    pub state: BallotState,
+}
+
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -37,6 +65,8 @@ pub enum DataKey {
     ResultHash(String),
     /// Whether a ballot has been created: ballot_id_hash → bool
     BallotExists(String),
+    /// Ballot metadata: ballot_id_hash → BallotMetadata
+    BallotMetadata(String),
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -71,10 +101,21 @@ impl AnonVoteContract {
             .set(&DataKey::TokensIssued(ballot_id_hash.clone()), &0u32);
         env.storage()
             .persistent()
-            .set(&DataKey::VotesCast(ballot_id_hash), &0u32);
+            .set(&DataKey::VotesCast(ballot_id_hash.clone()), &0u32);
 
-        env.events()
-            .publish((symbol_short!("ballot"),), (symbol_short!("created"),));
+        let metadata = BallotMetadata {
+            created_at: env.ledger().timestamp(),
+            admin: caller.clone(),
+            state: BallotState::Active,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::BallotMetadata(ballot_id_hash.clone()), &metadata);
+
+        env.events().publish(
+            (symbol_short!("audit"), symbol_short!("ballot_created")),
+            (ballot_id_hash.clone(), metadata.created_at, caller),
+        );
     }
 
     /// Increment the token issued count for a ballot.
@@ -84,12 +125,15 @@ impl AnonVoteContract {
         Self::require_admin(&env, &caller);
         Self::require_ballot_exists(&env, &ballot_id_hash);
 
-        let key = DataKey::TokensIssued(ballot_id_hash);
+        let key = DataKey::TokensIssued(ballot_id_hash.clone());
         let count: u32 = env.storage().persistent().get(&key).unwrap_or(0);
-        env.storage().persistent().set(&key, &(count + 1));
+        let new_count = count + 1;
+        env.storage().persistent().set(&key, &new_count);
 
-        env.events()
-            .publish((symbol_short!("token"),), (symbol_short!("issued"),));
+        env.events().publish(
+            (symbol_short!("audit"), symbol_short!("token_issued")),
+            (ballot_id_hash.clone(), new_count),
+        );
     }
 
     /// Increment the votes cast count for a ballot.
@@ -99,12 +143,15 @@ impl AnonVoteContract {
         Self::require_admin(&env, &caller);
         Self::require_ballot_exists(&env, &ballot_id_hash);
 
-        let key = DataKey::VotesCast(ballot_id_hash);
+        let key = DataKey::VotesCast(ballot_id_hash.clone());
         let count: u32 = env.storage().persistent().get(&key).unwrap_or(0);
-        env.storage().persistent().set(&key, &(count + 1));
+        let new_count = count + 1;
+        env.storage().persistent().set(&key, &new_count);
 
-        env.events()
-            .publish((symbol_short!("vote"),), (symbol_short!("cast"),));
+        env.events().publish(
+            (symbol_short!("audit"), symbol_short!("vote_cast")),
+            (ballot_id_hash.clone(), new_count),
+        );
     }
 
     /// Record the result publication for a ballot.
@@ -119,32 +166,46 @@ impl AnonVoteContract {
         Self::require_admin(&env, &caller);
         Self::require_ballot_exists(&env, &ballot_id_hash);
 
-        let key = DataKey::ResultHash(ballot_id_hash);
+        let key = DataKey::ResultHash(ballot_id_hash.clone());
         if env.storage().persistent().has(&key) {
             panic!("result already recorded");
         }
-        env.storage().persistent().set(&key, &result_hash);
+        env.storage().persistent().set(&key, &result_hash.clone());
 
-        env.events()
-            .publish((symbol_short!("result"),), (symbol_short!("published"),));
+        // Update ballot state to ResultPublished
+        let metadata_key = DataKey::BallotMetadata(ballot_id_hash.clone());
+        let mut metadata: BallotMetadata = env.storage().persistent().get(&metadata_key).unwrap();
+        metadata.state = BallotState::ResultPublished;
+        env.storage().persistent().set(&metadata_key, &metadata);
+
+        env.events().publish(
+            (symbol_short!("audit"), symbol_short!("result_published")),
+            (ballot_id_hash.clone(), result_hash),
+        );
     }
 
     // ── Read-only queries ────────────────────────────────────────────────────
 
     /// Get the number of tokens issued for a ballot.
-    pub fn get_tokens_issued(env: Env, ballot_id_hash: String) -> u32 {
+    /// Returns None if the ballot does not exist.
+    pub fn get_tokens_issued(env: Env, ballot_id_hash: String) -> Option<u32> {
+        if !env.storage().persistent().has(&DataKey::BallotExists(ballot_id_hash.clone())) {
+            return None;
+        }
         env.storage()
             .persistent()
             .get(&DataKey::TokensIssued(ballot_id_hash))
-            .unwrap_or(0)
     }
 
     /// Get the number of votes cast for a ballot.
-    pub fn get_votes_cast(env: Env, ballot_id_hash: String) -> u32 {
+    /// Returns None if the ballot does not exist.
+    pub fn get_votes_cast(env: Env, ballot_id_hash: String) -> Option<u32> {
+        if !env.storage().persistent().has(&DataKey::BallotExists(ballot_id_hash.clone())) {
+            return None;
+        }
         env.storage()
             .persistent()
             .get(&DataKey::VotesCast(ballot_id_hash))
-            .unwrap_or(0)
     }
 
     /// Get the result hash for a ballot (None if not yet published).
@@ -159,6 +220,51 @@ impl AnonVoteContract {
         env.storage()
             .persistent()
             .has(&DataKey::BallotExists(ballot_id_hash))
+    }
+
+    /// Get ballot metadata (created_at, admin, state).
+    /// Returns None if the ballot does not exist.
+    pub fn get_ballot_metadata(env: Env, ballot_id_hash: String) -> Option<BallotMetadata> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::BallotMetadata(ballot_id_hash))
+    }
+
+    /// Get complete ballot state snapshot (tokens, votes, result, metadata).
+    /// Returns None if the ballot does not exist.
+    pub fn get_ballot_state(env: Env, ballot_id_hash: String) -> Option<BallotStateSnapshot> {
+        if !env.storage().persistent().has(&DataKey::BallotExists(ballot_id_hash.clone())) {
+            return None;
+        }
+
+        let tokens_issued: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TokensIssued(ballot_id_hash.clone()))
+            .unwrap_or(0);
+        let votes_cast: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VotesCast(ballot_id_hash.clone()))
+            .unwrap_or(0);
+        let result_hash: Option<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ResultHash(ballot_id_hash.clone()));
+        let metadata: BallotMetadata = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BallotMetadata(ballot_id_hash))
+            .unwrap();
+
+        Some(BallotStateSnapshot {
+            tokens_issued,
+            votes_cast,
+            result_hash,
+            created_at: metadata.created_at,
+            admin: metadata.admin,
+            state: metadata.state,
+        })
     }
 
     /// Verify consistency: returns true if tokens_issued == votes_cast.
@@ -223,8 +329,8 @@ mod tests {
         let ballot_hash = String::from_str(&env, "abc123");
         client.record_ballot(&admin, &ballot_hash);
         assert!(client.ballot_exists(&ballot_hash));
-        assert_eq!(client.get_tokens_issued(&ballot_hash), 0);
-        assert_eq!(client.get_votes_cast(&ballot_hash), 0);
+        assert_eq!(client.get_tokens_issued(&ballot_hash), Some(0));
+        assert_eq!(client.get_votes_cast(&ballot_hash), Some(0));
     }
 
     #[test]
@@ -235,8 +341,8 @@ mod tests {
         client.record_token(&admin, &ballot_hash);
         client.record_token(&admin, &ballot_hash);
         client.record_vote(&admin, &ballot_hash);
-        assert_eq!(client.get_tokens_issued(&ballot_hash), 2);
-        assert_eq!(client.get_votes_cast(&ballot_hash), 1);
+        assert_eq!(client.get_tokens_issued(&ballot_hash), Some(2));
+        assert_eq!(client.get_votes_cast(&ballot_hash), Some(1));
         assert!(!client.is_consistent(&ballot_hash));
         client.record_vote(&admin, &ballot_hash);
         assert!(client.is_consistent(&ballot_hash));
@@ -259,5 +365,47 @@ mod tests {
         let ballot_hash = String::from_str(&env, "abc123");
         let attacker = Address::generate(&env);
         client.record_ballot(&attacker, &ballot_hash);
+    }
+
+    #[test]
+    fn test_ballot_metadata() {
+        let (env, client, admin) = setup();
+        let ballot_hash = String::from_str(&env, "abc123");
+        client.record_ballot(&admin, &ballot_hash);
+
+        let metadata = client.get_ballot_metadata(&ballot_hash).unwrap();
+        assert_eq!(metadata.admin, admin);
+        assert_eq!(metadata.state, BallotState::Active);
+        assert!(metadata.created_at > 0);
+    }
+
+    #[test]
+    fn test_ballot_state_snapshot() {
+        let (env, client, admin) = setup();
+        let ballot_hash = String::from_str(&env, "abc123");
+        let result_hash = String::from_str(&env, "deadbeef");
+
+        client.record_ballot(&admin, &ballot_hash);
+        client.record_token(&admin, &ballot_hash);
+        client.record_token(&admin, &ballot_hash);
+        client.record_vote(&admin, &ballot_hash);
+        client.record_result(&admin, &ballot_hash, &result_hash);
+
+        let state = client.get_ballot_state(&ballot_hash).unwrap();
+        assert_eq!(state.tokens_issued, 2);
+        assert_eq!(state.votes_cast, 1);
+        assert_eq!(state.result_hash, Some(result_hash));
+        assert_eq!(state.admin, admin);
+        assert_eq!(state.state, BallotState::ResultPublished);
+    }
+
+    #[test]
+    fn test_nonexistent_ballot() {
+        let (env, client, _admin) = setup();
+        let ballot_hash = String::from_str(&env, "nonexistent");
+        assert_eq!(client.get_tokens_issued(&ballot_hash), None);
+        assert_eq!(client.get_votes_cast(&ballot_hash), None);
+        assert_eq!(client.get_ballot_metadata(&ballot_hash), None);
+        assert_eq!(client.get_ballot_state(&ballot_hash), None);
     }
 }
