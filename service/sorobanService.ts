@@ -14,8 +14,8 @@
  * 2. Deploy to testnet:
  *      stellar contract deploy --wasm target/wasm32-unknown-unknown/release/anonvote.wasm --network testnet
  * 3. Initialize:
- *      stellar contract invoke --id <ID> -- initialize --admin <PUBLIC_KEY>
- * 4. Set SOROBAN_CONTRACT_ID=<ID> in backend/.env
+ *      stellar contract invoke --id <CONTRACT_ID> --network testnet -- initialize --admin <PUBLIC_KEY>
+ * 4. Set SOROBAN_CONTRACT_ID=<CONTRACT_ID> in backend/.env
  * 5. Call the helpers below from ballotEngine, identityManager, privacyEngine, resultEngine
  *
  * SDK USAGE (stellar-sdk v12):
@@ -35,6 +35,20 @@ export interface SorobanConfig {
   stellarSecretKey: string;
   stellarNetwork: "testnet" | "mainnet";
   contractId: string;
+}
+
+export enum BallotState {
+  Active = "Active",
+  ResultPublished = "ResultPublished",
+}
+
+export interface BallotStateSnapshot {
+  tokens_issued: number;
+  votes_cast: number;
+  result_hash: string | null;
+  created_at: number;
+  admin: string;
+  state: BallotState;
 }
 
 function getRpcUrl(network: string): string {
@@ -148,7 +162,7 @@ export async function invokeContract(
     }
 
     console.error("[Soroban] Transaction failed:", getResult);
-    return { txHash, success: false };
+    return { txHash: "", success: false };
   } catch (err) {
     console.error("[Soroban] invokeContract error:", err);
     return { txHash: "", success: false };
@@ -287,8 +301,8 @@ export async function sorobanGetAuditCounts(
   config: SorobanConfig,
   ballotIdHash: string,
 ): Promise<{
-  tokensIssued: number;
-  votesCast: number;
+  tokensIssued: number | null;
+  votesCast: number | null;
   isConsistent: boolean;
 } | null> {
   if (!config.contractId) return null;
@@ -304,8 +318,22 @@ export async function sorobanGetAuditCounts(
     ]),
   ]);
   return {
-    tokensIssued: (tokens as number) ?? 0,
-    votesCast: (votes as number) ?? 0,
+    tokensIssued: tokens as number | null,
+    votesCast: votes as number | null,
     isConsistent: (consistent as boolean) ?? false,
   };
+}
+
+/**
+ * Get complete ballot state snapshot (single read call).
+ */
+export async function sorobanGetBallotState(
+  config: SorobanConfig,
+  ballotIdHash: string,
+): Promise<BallotStateSnapshot | null> {
+  if (!config.contractId) return null;
+  const result = await readContract(config, "get_ballot_state", [
+    { value: ballotIdHash, type: "string" },
+  ]);
+  return result as BallotStateSnapshot | null;
 }
