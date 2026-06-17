@@ -37,6 +37,11 @@ export interface SorobanConfig {
   contractId: string;
 }
 
+export interface BallotLimits {
+  maxTokens: number;
+  maxVotes: number;
+}
+
 function getRpcUrl(network: string): string {
   return network === "mainnet" ? SOROBAN_RPC_MAINNET : SOROBAN_RPC_TESTNET;
 }
@@ -224,10 +229,15 @@ export async function readContract(
 export async function sorobanRecordBallot(
   config: SorobanConfig,
   ballotIdHash: string,
+  limits: BallotLimits,
 ): Promise<string> {
   if (!config.contractId) return "";
   const result = await invokeContract(config, "record_ballot", [
     { value: ballotIdHash, type: "string" },
+    {
+      value: { max_tokens: limits.maxTokens, max_votes: limits.maxVotes },
+      type: "map",
+    },
   ]);
   return result.txHash;
 }

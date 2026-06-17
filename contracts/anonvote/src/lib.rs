@@ -19,10 +19,31 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, String,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String,
 };
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone)]
+pub struct BallotLimits {
+    pub max_tokens: u32,
+    pub max_votes: u32,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct BallotMetadata {
+    pub limits: BallotLimits,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    LimitExceeded = 1,
+    BallotNotFound = 2,
+}
 
 #[contracttype]
 #[derive(Clone)]
@@ -35,8 +56,8 @@ pub enum DataKey {
     VotesCast(String),
     /// Result hash for a ballot: ballot_id_hash → String
     ResultHash(String),
-    /// Whether a ballot has been created: ballot_id_hash → bool
-    BallotExists(String),
+    /// Ballot metadata: ballot_id_hash → BallotMetadata
+    BallotMetadata(String),
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -57,15 +78,22 @@ impl AnonVoteContract {
 
     /// Record a ballot creation event.
     /// ballot_id_hash: SHA-256 hex of the ballot UUID
-    pub fn record_ballot(env: Env, caller: Address, ballot_id_hash: String) {
+    pub fn record_ballot(
+        env: Env,
+        caller: Address,
+        ballot_id_hash: String,
+        limits: BallotLimits,
+    ) -> Result<(), Error> {
         caller.require_auth();
         Self::require_admin(&env, &caller);
 
-        let key = DataKey::BallotExists(ballot_id_hash.clone());
+        let key = DataKey::BallotMetadata(ballot_id_hash.clone());
         if env.storage().persistent().has(&key) {
             panic!("ballot already recorded");
         }
-        env.storage().persistent().set(&key, &true);
+        env.storage()
+            .persistent()
+            .set(&key, &BallotMetadata { limits });
         env.storage()
             .persistent()
             .set(&DataKey::TokensIssued(ballot_id_hash.clone()), &0u32);
@@ -75,36 +103,53 @@ impl AnonVoteContract {
 
         env.events()
             .publish((symbol_short!("ballot"),), (symbol_short!("created"),));
+        Ok(())
     }
 
     /// Increment the token issued count for a ballot.
     /// Called when a voter token is issued.
-    pub fn record_token(env: Env, caller: Address, ballot_id_hash: String) {
+    pub fn record_token(env: Env, caller: Address, ballot_id_hash: String) -> Result<(), Error> {
         caller.require_auth();
         Self::require_admin(&env, &caller);
-        Self::require_ballot_exists(&env, &ballot_id_hash);
+        let metadata = Self::require_ballot_metadata(&env, &ballot_id_hash)?;
 
         let key = DataKey::TokensIssued(ballot_id_hash);
         let count: u32 = env.storage().persistent().get(&key).unwrap_or(0);
+        if count >= metadata.limits.max_tokens {
+            env.events().publish(
+                (symbol_short!("limit"), symbol_short!("token")),
+                (symbol_short!("current"), count),
+            );
+            return Err(Error::LimitExceeded);
+        }
         env.storage().persistent().set(&key, &(count + 1));
 
         env.events()
             .publish((symbol_short!("token"),), (symbol_short!("issued"),));
+        Ok(())
     }
 
     /// Increment the votes cast count for a ballot.
     /// Called when a vote is submitted.
-    pub fn record_vote(env: Env, caller: Address, ballot_id_hash: String) {
+    pub fn record_vote(env: Env, caller: Address, ballot_id_hash: String) -> Result<(), Error> {
         caller.require_auth();
         Self::require_admin(&env, &caller);
-        Self::require_ballot_exists(&env, &ballot_id_hash);
+        let metadata = Self::require_ballot_metadata(&env, &ballot_id_hash)?;
 
         let key = DataKey::VotesCast(ballot_id_hash);
         let count: u32 = env.storage().persistent().get(&key).unwrap_or(0);
+        if count >= metadata.limits.max_votes {
+            env.events().publish(
+                (symbol_short!("limit"), symbol_short!("vote")),
+                (symbol_short!("current"), count),
+            );
+            return Err(Error::LimitExceeded);
+        }
         env.storage().persistent().set(&key, &(count + 1));
 
         env.events()
             .publish((symbol_short!("vote"),), (symbol_short!("cast"),));
+        Ok(())
     }
 
     /// Record the result publication for a ballot.
@@ -114,10 +159,10 @@ impl AnonVoteContract {
         caller: Address,
         ballot_id_hash: String,
         result_hash: String,
-    ) {
+    ) -> Result<(), Error> {
         caller.require_auth();
         Self::require_admin(&env, &caller);
-        Self::require_ballot_exists(&env, &ballot_id_hash);
+        Self::require_ballot_metadata(&env, &ballot_id_hash)?;
 
         let key = DataKey::ResultHash(ballot_id_hash);
         if env.storage().persistent().has(&key) {
@@ -127,6 +172,7 @@ impl AnonVoteContract {
 
         env.events()
             .publish((symbol_short!("result"),), (symbol_short!("published"),));
+        Ok(())
     }
 
     // ── Read-only queries ────────────────────────────────────────────────────
@@ -158,7 +204,7 @@ impl AnonVoteContract {
     pub fn ballot_exists(env: Env, ballot_id_hash: String) -> bool {
         env.storage()
             .persistent()
-            .has(&DataKey::BallotExists(ballot_id_hash))
+            .has(&DataKey::BallotMetadata(ballot_id_hash))
     }
 
     /// Verify consistency: returns true if tokens_issued == votes_cast.
@@ -189,14 +235,14 @@ impl AnonVoteContract {
         }
     }
 
-    fn require_ballot_exists(env: &Env, ballot_id_hash: &String) {
-        if !env
-            .storage()
+    fn require_ballot_metadata(
+        env: &Env,
+        ballot_id_hash: &String,
+    ) -> Result<BallotMetadata, Error> {
+        env.storage()
             .persistent()
-            .has(&DataKey::BallotExists(ballot_id_hash.clone()))
-        {
-            panic!("ballot not found");
-        }
+            .get(&DataKey::BallotMetadata(ballot_id_hash.clone()))
+            .ok_or(Error::BallotNotFound)
     }
 }
 
@@ -217,11 +263,18 @@ mod tests {
         (env, client, admin)
     }
 
+    fn limits(max_tokens: u32, max_votes: u32) -> BallotLimits {
+        BallotLimits {
+            max_tokens,
+            max_votes,
+        }
+    }
+
     #[test]
     fn test_record_ballot_and_query() {
         let (env, client, admin) = setup();
         let ballot_hash = String::from_str(&env, "abc123");
-        client.record_ballot(&admin, &ballot_hash);
+        client.record_ballot(&admin, &ballot_hash, &limits(10, 10));
         assert!(client.ballot_exists(&ballot_hash));
         assert_eq!(client.get_tokens_issued(&ballot_hash), 0);
         assert_eq!(client.get_votes_cast(&ballot_hash), 0);
@@ -231,7 +284,7 @@ mod tests {
     fn test_token_and_vote_counts() {
         let (env, client, admin) = setup();
         let ballot_hash = String::from_str(&env, "abc123");
-        client.record_ballot(&admin, &ballot_hash);
+        client.record_ballot(&admin, &ballot_hash, &limits(10, 10));
         client.record_token(&admin, &ballot_hash);
         client.record_token(&admin, &ballot_hash);
         client.record_vote(&admin, &ballot_hash);
@@ -247,9 +300,49 @@ mod tests {
         let (env, client, admin) = setup();
         let ballot_hash = String::from_str(&env, "abc123");
         let result_hash = String::from_str(&env, "deadbeef");
-        client.record_ballot(&admin, &ballot_hash);
+        client.record_ballot(&admin, &ballot_hash, &limits(10, 10));
         client.record_result(&admin, &ballot_hash, &result_hash);
         assert_eq!(client.get_result_hash(&ballot_hash), Some(result_hash));
+    }
+
+    #[test]
+    fn test_limits_are_enforced_correctly() {
+        let (env, client, admin) = setup();
+        let ballot_hash = String::from_str(&env, "limited");
+        client.record_ballot(&admin, &ballot_hash, &limits(2, 1));
+
+        assert_eq!(client.try_record_token(&admin, &ballot_hash), Ok(Ok(())));
+        assert_eq!(client.try_record_token(&admin, &ballot_hash), Ok(Ok(())));
+        assert_eq!(
+            client.try_record_token(&admin, &ballot_hash),
+            Err(Ok(Error::LimitExceeded))
+        );
+        assert_eq!(client.get_tokens_issued(&ballot_hash), 2);
+
+        assert_eq!(client.try_record_vote(&admin, &ballot_hash), Ok(Ok(())));
+        assert_eq!(
+            client.try_record_vote(&admin, &ballot_hash),
+            Err(Ok(Error::LimitExceeded))
+        );
+        assert_eq!(client.get_votes_cast(&ballot_hash), 1);
+    }
+
+    #[test]
+    fn test_zero_limit_blocks_all_operations() {
+        let (env, client, admin) = setup();
+        let ballot_hash = String::from_str(&env, "zero");
+        client.record_ballot(&admin, &ballot_hash, &limits(0, 0));
+
+        assert_eq!(
+            client.try_record_token(&admin, &ballot_hash),
+            Err(Ok(Error::LimitExceeded))
+        );
+        assert_eq!(
+            client.try_record_vote(&admin, &ballot_hash),
+            Err(Ok(Error::LimitExceeded))
+        );
+        assert_eq!(client.get_tokens_issued(&ballot_hash), 0);
+        assert_eq!(client.get_votes_cast(&ballot_hash), 0);
     }
 
     #[test]
@@ -258,6 +351,6 @@ mod tests {
         let (env, client, _admin) = setup();
         let ballot_hash = String::from_str(&env, "abc123");
         let attacker = Address::generate(&env);
-        client.record_ballot(&attacker, &ballot_hash);
+        client.record_ballot(&attacker, &ballot_hash, &limits(10, 10));
     }
 }
