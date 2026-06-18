@@ -13,6 +13,8 @@ import {
   sorobanRecordVote,
   sorobanRecordResult,
   sorobanGetAuditCounts,
+  sorobanTransitionBallotState,
+  BallotState,
   SorobanErrorCode,
   type SorobanConfig,
 } from "./sorobanService";
@@ -157,5 +159,77 @@ describe("AnonVote ballot lifecycle (mocked contract, no live network)", () => {
     } else {
       expect(result.txHash).toBeTypeOf("string");
     }
+  });
+});
+
+describe("AnonVote ballot state transitions (mocked contract, no live network)", () => {
+  it("full lifecycle: Active → ResultPublished (via record_result) → Archived (via transition)", async () => {
+    const config = makeConfig();
+    const ballotIdHash = "state-ballot-001";
+
+    await sorobanRecordBallot(config, ballotIdHash);
+    await sorobanRecordResult(config, ballotIdHash, "result-hash-xyz");
+
+    const archiveResult = await sorobanTransitionBallotState(
+      config,
+      ballotIdHash,
+      BallotState.Archived,
+    );
+    expect(archiveResult.success).toBe(true);
+  });
+
+  it("explicit Active → ResultPublished transition via transition_ballot_state succeeds", async () => {
+    const config = makeConfig();
+    const ballotIdHash = "state-ballot-002";
+
+    await sorobanRecordBallot(config, ballotIdHash);
+    const result = await sorobanTransitionBallotState(
+      config,
+      ballotIdHash,
+      BallotState.ResultPublished,
+    );
+    expect(result.success).toBe(true);
+  });
+
+  it("invalid skip: Active → Archived returns InvalidStateTransition", async () => {
+    const config = makeConfig();
+    const ballotIdHash = "state-ballot-003";
+
+    await sorobanRecordBallot(config, ballotIdHash);
+    const result = await sorobanTransitionBallotState(
+      config,
+      ballotIdHash,
+      BallotState.Archived,
+    );
+    expect(result.success).toBe(false);
+    expect(result.errorCode).toBe(SorobanErrorCode.InvalidStateTransition);
+  });
+
+  it("invalid backward: Archived → Active returns InvalidStateTransition", async () => {
+    const config = makeConfig();
+    const ballotIdHash = "state-ballot-004";
+
+    await sorobanRecordBallot(config, ballotIdHash);
+    await sorobanRecordResult(config, ballotIdHash, "result-hash-zzz");
+    await sorobanTransitionBallotState(config, ballotIdHash, BallotState.Archived);
+
+    const backward = await sorobanTransitionBallotState(
+      config,
+      ballotIdHash,
+      BallotState.Active,
+    );
+    expect(backward.success).toBe(false);
+    expect(backward.errorCode).toBe(SorobanErrorCode.InvalidStateTransition);
+  });
+
+  it("transition on non-existent ballot returns BallotNotFound", async () => {
+    const config = makeConfig();
+    const result = await sorobanTransitionBallotState(
+      config,
+      "phantom-ballot",
+      BallotState.ResultPublished,
+    );
+    expect(result.success).toBe(false);
+    expect(result.errorCode).toBe(SorobanErrorCode.BallotNotFound);
   });
 });

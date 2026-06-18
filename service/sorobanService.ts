@@ -37,7 +37,8 @@ export enum SorobanErrorCode {
   InvalidBallotHash      = 8,
   UpgradeAlreadyScheduled = 9,
   NoUpgradeScheduled    = 10,
-  TimeLockNotExpired    = 11,
+  TimeLockNotExpired      = 11,
+  InvalidStateTransition  = 12,
   // Non-contract errors
   SimulationFailed       = 100,
   TransactionFailed      = 101,
@@ -56,7 +57,8 @@ const ERROR_MESSAGES: Record<SorobanErrorCode, string> = {
   [SorobanErrorCode.InvalidBallotHash]:      "Ballot hash must not be empty",
   [SorobanErrorCode.UpgradeAlreadyScheduled]: "An upgrade is already scheduled",
   [SorobanErrorCode.NoUpgradeScheduled]:    "No upgrade is currently scheduled",
-  [SorobanErrorCode.TimeLockNotExpired]:    "Time lock has not yet expired for the scheduled upgrade",
+  [SorobanErrorCode.TimeLockNotExpired]:      "Time lock has not yet expired for the scheduled upgrade",
+  [SorobanErrorCode.InvalidStateTransition]: "Invalid state transition — only Active→ResultPublished→Archived is allowed",
   [SorobanErrorCode.SimulationFailed]:       "Transaction simulation failed",
   [SorobanErrorCode.TransactionFailed]:      "Transaction submission failed",
   [SorobanErrorCode.NetworkError]:           "Network or RPC error",
@@ -94,6 +96,7 @@ export interface SorobanConfig {
 export enum BallotState {
   Active          = "Active",
   ResultPublished = "ResultPublished",
+  Archived        = "Archived",
 }
 
 export interface BallotStateSnapshot {
@@ -103,6 +106,7 @@ export interface BallotStateSnapshot {
   created_at: number;
   admin: string;
   state: BallotState;
+  state_updated_at: number;
 }
 
 export interface SorobanInvokeResult {
@@ -122,7 +126,8 @@ export type SorobanAuditEventType =
   | "admin_rotated"
   | "upgrade_scheduled"
   | "upgrade_canceled"
-  | "upgrade_executed";
+  | "upgrade_executed"
+  | "state_transition";
 
 export interface SorobanEventFilter {
   eventType?: SorobanAuditEventType | string;
@@ -149,6 +154,8 @@ export interface SorobanEventData {
   newWasmHash?: string | undefined;
   scheduledAt?: number | undefined;
   executableAt?: number | undefined;
+  newState?: string | undefined;
+  transitionedAt?: number | undefined;
   topics: unknown[];
   value: unknown;
 }
@@ -256,6 +263,8 @@ const EVENT_SYMBOL_TO_TYPE: Record<string, SorobanAuditEventType> = {
   upgrade_canceled: "upgrade_canceled",
   upg_excd: "upgrade_executed",
   upgrade_executed: "upgrade_executed",
+  stt_chng: "state_transition",
+  state_transition: "state_transition",
 };
 
 const EVENT_TYPE_TO_SYMBOL: Record<SorobanAuditEventType, string> = {
@@ -268,6 +277,7 @@ const EVENT_TYPE_TO_SYMBOL: Record<SorobanAuditEventType, string> = {
   upgrade_scheduled: "upg_schd",
   upgrade_canceled: "upg_cncl",
   upgrade_executed: "upg_excd",
+  state_transition: "stt_chng",
 };
 
 const SOROBAN_EVENT_PAGE_LIMIT = 100;
@@ -372,6 +382,11 @@ export function parseSorobanEvent(event: unknown): SorobanEventData {
       break;
     case "upgrade_executed":
       parsed.newWasmHash = tuple[0] !== undefined ? String(tuple[0]) : undefined;
+      break;
+    case "state_transition":
+      parsed.ballotIdHash = String(tuple[0] ?? "");
+      parsed.newState = tuple[1] !== undefined ? String(tuple[1]) : undefined;
+      parsed.transitionedAt = tuple[2] !== undefined ? Number(tuple[2]) : undefined;
       break;
   }
 
@@ -814,6 +829,35 @@ export async function sorobanRotateAdmin(
   if (!result.success && result.errorCode !== undefined) {
     console.error(
       `[Soroban] sorobanRotateAdmin failed — ${SorobanErrorCode[result.errorCode]}: ${result.errorMessage}`,
+    );
+  }
+  return result;
+}
+
+/**
+ * Transition a ballot's lifecycle state on-chain (admin only).
+ * Allowed transitions: Active → ResultPublished → Archived.
+ * Returns InvalidStateTransition for any other transition, including backward moves.
+ */
+export async function sorobanTransitionBallotState(
+  config: SorobanConfig,
+  ballotIdHash: string,
+  newState: BallotState,
+): Promise<SorobanInvokeResult> {
+  const configCheck = validateSorobanConfig(config);
+  if (!configCheck.valid) {
+    console.warn(`[Soroban] sorobanTransitionBallotState: ${configCheck.error.message}`);
+    return { txHash: "", success: false, ...makeError(SorobanErrorCode.NotConfigured) };
+  }
+  const caller = StellarSdk.Keypair.fromSecret(config.stellarSecretKey).publicKey();
+  const result = await invokeContract(config, "transition_ballot_state", [
+    { value: caller, type: "address" },
+    { value: ballotIdHash, type: "string" },
+    { value: newState, type: "symbol" },
+  ]);
+  if (!result.success && result.errorCode !== undefined) {
+    console.error(
+      `[Soroban] sorobanTransitionBallotState failed — ${SorobanErrorCode[result.errorCode]}: ${result.errorMessage}`,
     );
   }
   return result;

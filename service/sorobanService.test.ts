@@ -20,6 +20,8 @@ import {
   readContract,
   validateSorobanConfig,
   validateContractId,
+  sorobanTransitionBallotState,
+  BallotState,
   SorobanErrorCode,
   DEFAULT_RETRY_POLICY,
   type SorobanConfig,
@@ -189,5 +191,57 @@ describe("invokeContract — exponential backoff polling", () => {
       initialDelayMs: 1500,
       backoffMultiplier: 1.5,
     });
+  });
+});
+
+describe("sorobanTransitionBallotState — state transition guard", () => {
+  it("returns success and a txHash for a valid transition", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess());
+    mockRpc.sendTransaction.mockResolvedValueOnce({ status: "PENDING", hash: "tx-transition" });
+    mockRpc.getTransaction.mockResolvedValueOnce(txSuccess());
+
+    const result = await sorobanTransitionBallotState(
+      makeConfig(),
+      "ballot-a",
+      BallotState.ResultPublished,
+    );
+    expect(result.success).toBe(true);
+    expect(result.txHash).toBe("tx-transition");
+  });
+
+  it("returns InvalidStateTransition when the contract rejects the transition", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #12)"));
+
+    const result = await sorobanTransitionBallotState(
+      makeConfig(),
+      "ballot-b",
+      BallotState.Archived,
+    );
+    expect(result.success).toBe(false);
+    expect(result.errorCode).toBe(SorobanErrorCode.InvalidStateTransition);
+    expect(mockRpc.sendTransaction).not.toHaveBeenCalled();
+  });
+
+  it("returns BallotNotFound when the ballot does not exist", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #4)"));
+
+    const result = await sorobanTransitionBallotState(
+      makeConfig(),
+      "never-created",
+      BallotState.ResultPublished,
+    );
+    expect(result.success).toBe(false);
+    expect(result.errorCode).toBe(SorobanErrorCode.BallotNotFound);
+  });
+
+  it("returns NotConfigured without calling RPC when config is invalid", async () => {
+    const result = await sorobanTransitionBallotState(
+      makeConfig({ stellarSecretKey: "bad-key" }),
+      "ballot-c",
+      BallotState.Archived,
+    );
+    expect(result.success).toBe(false);
+    expect(result.errorCode).toBe(SorobanErrorCode.NotConfigured);
+    expect(mockRpc.simulateTransaction).not.toHaveBeenCalled();
   });
 });

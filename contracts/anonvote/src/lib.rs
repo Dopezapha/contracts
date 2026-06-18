@@ -32,17 +32,18 @@ const TIME_LOCK_SECONDS: u64 = TIME_LOCK_HOURS * 60 * 60;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum ContractError {
-    AdminUnauthorized     = 1,
-    AlreadyInitialized    = 2,
-    NotInitialized        = 3,
-    BallotNotFound        = 4,
-    BallotAlreadyExists   = 5,
-    ResultAlreadyPublished = 6,
-    CounterOverflow       = 7,
-    InvalidBallotHash     = 8,
+    AdminUnauthorized       = 1,
+    AlreadyInitialized      = 2,
+    NotInitialized          = 3,
+    BallotNotFound          = 4,
+    BallotAlreadyExists     = 5,
+    ResultAlreadyPublished  = 6,
+    CounterOverflow         = 7,
+    InvalidBallotHash       = 8,
     UpgradeAlreadyScheduled = 9,
-    NoUpgradeScheduled    = 10,
-    TimeLockNotExpired    = 11,
+    NoUpgradeScheduled      = 10,
+    TimeLockNotExpired      = 11,
+    InvalidStateTransition  = 12,
 }
 
 // ── Upgrade types ─────────────────────────────────────────────────────────────
@@ -61,6 +62,7 @@ pub struct PendingUpgrade {
 pub enum BallotState {
     Active,
     ResultPublished,
+    Archived,
 }
 
 #[contracttype]
@@ -69,6 +71,7 @@ pub struct BallotMetadata {
     pub created_at: u64,
     pub admin: Address,
     pub state: BallotState,
+    pub state_updated_at: u64,
 }
 
 #[contracttype]
@@ -80,6 +83,7 @@ pub struct BallotStateSnapshot {
     pub created_at: u64,
     pub admin: Address,
     pub state: BallotState,
+    pub state_updated_at: u64,
 }
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
@@ -168,6 +172,7 @@ impl AnonVoteContract {
             created_at,
             admin: caller.clone(),
             state: BallotState::Active,
+            state_updated_at: created_at,
         };
         env.storage()
             .persistent()
@@ -269,11 +274,52 @@ impl AnonVoteContract {
         let mut metadata: BallotMetadata =
             env.storage().persistent().get(&metadata_key).unwrap();
         metadata.state = BallotState::ResultPublished;
+        metadata.state_updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&metadata_key, &metadata);
 
         env.events().publish(
             (symbol_short!("audit"), symbol_short!("res_pub")),
             (ballot_id_hash, result_hash),
+        );
+        Ok(())
+    }
+
+    /// Transition a ballot's lifecycle state.
+    /// Allowed transitions: Active → ResultPublished → Archived.
+    /// All other transitions (including backward) return InvalidStateTransition.
+    /// Emits a state_transition audit event with the new state and timestamp.
+    pub fn transition_ballot_state(
+        env: Env,
+        caller: Address,
+        ballot_id_hash: String,
+        new_state: BallotState,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        Self::require_admin(&env, &caller)?;
+        Self::require_ballot_exists(&env, &ballot_id_hash)?;
+
+        let metadata_key = DataKey::BallotMetadata(ballot_id_hash.clone());
+        let mut metadata: BallotMetadata =
+            env.storage().persistent().get(&metadata_key).unwrap();
+
+        let valid = matches!(
+            (&metadata.state, &new_state),
+            (BallotState::Active, BallotState::ResultPublished)
+                | (BallotState::ResultPublished, BallotState::Archived)
+        );
+
+        if !valid {
+            return Err(ContractError::InvalidStateTransition);
+        }
+
+        let now = env.ledger().timestamp();
+        metadata.state = new_state.clone();
+        metadata.state_updated_at = now;
+        env.storage().persistent().set(&metadata_key, &metadata);
+
+        env.events().publish(
+            (symbol_short!("audit"), symbol_short!("stt_chng")),
+            (ballot_id_hash, new_state, now),
         );
         Ok(())
     }
@@ -484,6 +530,7 @@ impl AnonVoteContract {
             created_at: metadata.created_at,
             admin: metadata.admin,
             state: metadata.state,
+            state_updated_at: metadata.state_updated_at,
         })
     }
 
@@ -889,5 +936,150 @@ mod tests {
         let new_wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
         let err = client.try_schedule_upgrade(&attacker, &new_wasm_hash).unwrap_err().unwrap();
         assert_eq!(err, ContractError::AdminUnauthorized);
+    }
+
+    // ── State transition tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_transition_active_to_result_published() {
+        let (env, client, admin) = setup();
+        let ballot_hash = String::from_str(&env, "abc123");
+        client.try_record_ballot(&admin, &ballot_hash).unwrap().unwrap();
+
+        let meta = client.get_ballot_metadata(&ballot_hash).unwrap();
+        assert_eq!(meta.state, BallotState::Active);
+
+        client
+            .try_transition_ballot_state(&admin, &ballot_hash, &BallotState::ResultPublished)
+            .unwrap()
+            .unwrap();
+
+        let meta = client.get_ballot_metadata(&ballot_hash).unwrap();
+        assert_eq!(meta.state, BallotState::ResultPublished);
+    }
+
+    #[test]
+    fn test_transition_result_published_to_archived() {
+        let (env, client, admin) = setup();
+        let ballot_hash = String::from_str(&env, "abc123");
+        let result_hash = String::from_str(&env, "deadbeef");
+        client.try_record_ballot(&admin, &ballot_hash).unwrap().unwrap();
+        client.try_record_result(&admin, &ballot_hash, &result_hash).unwrap().unwrap();
+
+        client
+            .try_transition_ballot_state(&admin, &ballot_hash, &BallotState::Archived)
+            .unwrap()
+            .unwrap();
+
+        let meta = client.get_ballot_metadata(&ballot_hash).unwrap();
+        assert_eq!(meta.state, BallotState::Archived);
+    }
+
+    #[test]
+    fn test_transition_active_to_archived_fails() {
+        let (env, client, admin) = setup();
+        let ballot_hash = String::from_str(&env, "abc123");
+        client.try_record_ballot(&admin, &ballot_hash).unwrap().unwrap();
+
+        let err = client
+            .try_transition_ballot_state(&admin, &ballot_hash, &BallotState::Archived)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::InvalidStateTransition);
+    }
+
+    #[test]
+    fn test_transition_backward_archived_to_active_fails() {
+        let (env, client, admin) = setup();
+        let ballot_hash = String::from_str(&env, "abc123");
+        let result_hash = String::from_str(&env, "deadbeef");
+        client.try_record_ballot(&admin, &ballot_hash).unwrap().unwrap();
+        client.try_record_result(&admin, &ballot_hash, &result_hash).unwrap().unwrap();
+        client
+            .try_transition_ballot_state(&admin, &ballot_hash, &BallotState::Archived)
+            .unwrap()
+            .unwrap();
+
+        let err = client
+            .try_transition_ballot_state(&admin, &ballot_hash, &BallotState::Active)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::InvalidStateTransition);
+    }
+
+    #[test]
+    fn test_transition_backward_result_published_to_active_fails() {
+        let (env, client, admin) = setup();
+        let ballot_hash = String::from_str(&env, "abc123");
+        let result_hash = String::from_str(&env, "deadbeef");
+        client.try_record_ballot(&admin, &ballot_hash).unwrap().unwrap();
+        client.try_record_result(&admin, &ballot_hash, &result_hash).unwrap().unwrap();
+
+        let err = client
+            .try_transition_ballot_state(&admin, &ballot_hash, &BallotState::Active)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::InvalidStateTransition);
+    }
+
+    #[test]
+    fn test_transition_unauthorized() {
+        let (env, client, _admin) = setup();
+        let ballot_hash = String::from_str(&env, "abc123");
+        let attacker = Address::generate(&env);
+        let err = client
+            .try_transition_ballot_state(&attacker, &ballot_hash, &BallotState::ResultPublished)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::AdminUnauthorized);
+    }
+
+    #[test]
+    fn test_transition_ballot_not_found() {
+        let (env, client, admin) = setup();
+        let ballot_hash = String::from_str(&env, "nonexistent");
+        let err = client
+            .try_transition_ballot_state(&admin, &ballot_hash, &BallotState::ResultPublished)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::BallotNotFound);
+    }
+
+    #[test]
+    fn test_record_result_auto_transitions_to_result_published() {
+        let (env, client, admin) = setup();
+        let ballot_hash = String::from_str(&env, "abc123");
+        let result_hash = String::from_str(&env, "deadbeef");
+        client.try_record_ballot(&admin, &ballot_hash).unwrap().unwrap();
+
+        let meta = client.get_ballot_metadata(&ballot_hash).unwrap();
+        assert_eq!(meta.state, BallotState::Active);
+
+        client.try_record_result(&admin, &ballot_hash, &result_hash).unwrap().unwrap();
+
+        let meta = client.get_ballot_metadata(&ballot_hash).unwrap();
+        assert_eq!(meta.state, BallotState::ResultPublished);
+    }
+
+    #[test]
+    fn test_state_updated_at_advances_on_transition() {
+        use soroban_sdk::testutils::Ledger as _;
+        let (env, client, admin) = setup();
+        let ballot_hash = String::from_str(&env, "abc123");
+
+        client.try_record_ballot(&admin, &ballot_hash).unwrap().unwrap();
+        let meta_before = client.get_ballot_metadata(&ballot_hash).unwrap();
+        assert_eq!(meta_before.state_updated_at, meta_before.created_at);
+
+        env.ledger().with_mut(|li| li.timestamp = 1000);
+
+        client
+            .try_transition_ballot_state(&admin, &ballot_hash, &BallotState::ResultPublished)
+            .unwrap()
+            .unwrap();
+
+        let meta_after = client.get_ballot_metadata(&ballot_hash).unwrap();
+        assert_eq!(meta_after.state, BallotState::ResultPublished);
+        assert_eq!(meta_after.state_updated_at, 1000);
     }
 }

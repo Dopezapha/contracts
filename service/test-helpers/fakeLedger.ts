@@ -18,6 +18,7 @@ type FakeBallot = {
   tokensIssued: number;
   votesCast: number;
   resultHash: string | null;
+  state: "Active" | "ResultPublished" | "Archived";
 };
 
 export type LedgerOutcome =
@@ -29,6 +30,7 @@ const ContractErrorCode = {
   BallotNotFound: 4,
   BallotAlreadyExists: 5,
   ResultAlreadyPublished: 6,
+  InvalidStateTransition: 12,
 };
 
 export class FakeLedger {
@@ -51,6 +53,7 @@ export class FakeLedger {
           tokensIssued: 0,
           votesCast: 0,
           resultHash: null,
+          state: "Active",
         });
         return { ok: true };
       }
@@ -77,6 +80,21 @@ export class FakeLedger {
           return { ok: false, contractErrorCode: ContractErrorCode.ResultAlreadyPublished };
         }
         ballot.resultHash = resultHash;
+        ballot.state = "ResultPublished";
+        return { ok: true };
+      }
+
+      case "transition_ballot_state": {
+        const ballot = this.ballots.get(get(1) as string);
+        if (!ballot) return { ok: false, contractErrorCode: ContractErrorCode.BallotNotFound };
+        const newState = get(2) as string;
+        const valid =
+          (ballot.state === "Active" && newState === "ResultPublished") ||
+          (ballot.state === "ResultPublished" && newState === "Archived");
+        if (!valid) {
+          return { ok: false, contractErrorCode: ContractErrorCode.InvalidStateTransition };
+        }
+        ballot.state = newState as "Active" | "ResultPublished" | "Archived";
         return { ok: true };
       }
 
