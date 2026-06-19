@@ -10,6 +10,16 @@
 //! - Records result publication with a tally hash
 //! - Allows public verification of event counts on-chain
 //!
+//! # Access control model (Issue #31)
+//! - `Admin`          — full privileges; manages roles; immutable supremacy
+//! - `BallotOperator` — can record ballots, tokens, and votes
+//! - `ResultVerifier` — can publish results
+//! - `ReadOnly`       — view-only; no state-changing calls permitted
+//!
+//! One address can hold multiple roles.  Roles are revoked immediately upon
+//! `revoke_role`.  Admin always retains full privileges regardless of explicit
+//! role grants.
+//!
 //! # Privacy guarantees
 //! - No voter identifiers stored
 //! - No token values stored
@@ -119,7 +129,7 @@ pub struct BallotStateSnapshot {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
-    /// Admin address — only admin can record events
+    /// Admin address — only admin can manage roles
     Admin,
     /// Timestamp of contract initialization
     InitializedAt,
@@ -146,6 +156,8 @@ pub struct AnonVoteContract;
 
 #[contractimpl]
 impl AnonVoteContract {
+    // ── Initialisation ───────────────────────────────────────────────────────
+
     /// Initialize the contract with an admin address.
     /// Must be called once after deployment.
     /// Returns AlreadyInitialized if called again (idempotent-safe).
@@ -176,6 +188,89 @@ impl AnonVoteContract {
             .set(&DataKey::InitializedAt, &env.ledger().timestamp());
         Ok(())
     }
+
+    // ── Role management (admin only) ─────────────────────────────────────────
+
+    /// Grant `role` to `grantee`.  Only the admin may call this.
+    ///
+    /// If the grantee already holds the role the call is a no-op (idempotent).
+    pub fn grant_role(env: Env, caller: Address, grantee: Address, role: Role) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        let key = DataKey::Roles(grantee.clone());
+        let mut roles: Vec<Role> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| vec![&env]);
+
+        // Idempotent: only push if not already present
+        let mut already_has = false;
+        for r in roles.iter() {
+            if r == role {
+                already_has = true;
+                break;
+            }
+        }
+        if !already_has {
+            roles.push_back(role);
+            env.storage().persistent().set(&key, &roles);
+        }
+
+        env.events()
+            .publish((symbol_short!("role"),), (symbol_short!("granted"),));
+    }
+
+    /// Revoke `role` from `grantee`.  Only the admin may call this.
+    ///
+    /// Revocation takes effect immediately — subsequent calls by `grantee`
+    /// that require the revoked role will be rejected.
+    pub fn revoke_role(env: Env, caller: Address, grantee: Address, role: Role) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        let key = DataKey::Roles(grantee.clone());
+        let roles: Vec<Role> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| vec![&env]);
+
+        // Rebuild without the revoked role
+        let mut updated: Vec<Role> = vec![&env];
+        for r in roles.iter() {
+            if r != role {
+                updated.push_back(r);
+            }
+        }
+        env.storage().persistent().set(&key, &updated);
+
+        env.events()
+            .publish((symbol_short!("role"),), (symbol_short!("revoked"),));
+    }
+
+    /// Returns true if `addr` holds `role` (or is the admin).
+    pub fn has_role(env: Env, addr: Address, role: Role) -> bool {
+        // Admin always has every role
+        if Self::is_admin(&env, &addr) {
+            return true;
+        }
+        let key = DataKey::Roles(addr);
+        let roles: Vec<Role> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| vec![&env]);
+        for r in roles.iter() {
+            if r == role {
+                return true;
+            }
+        }
+        false
+    }
+
+    // ── Write operations ─────────────────────────────────────────────────────
 
     /// Record a ballot creation event.
     /// ballot_id_hash: SHA-256 hex of the ballot UUID.
@@ -835,6 +930,108 @@ mod tests {
         assert_eq!(client.get_result_hash(&ballot_hash), Some(result_hash));
     }
 
+    // ── Role grant / revoke ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_grant_ballot_operator_can_record() {
+        let (env, client, admin) = setup();
+        let operator = Address::generate(&env);
+        let ballot_hash = String::from_str(&env, "op_ballot");
+
+        client.grant_role(&admin, &operator, &Role::BallotOperator);
+        assert!(client.has_role(&operator, &Role::BallotOperator));
+
+        client.record_ballot(&operator, &ballot_hash);
+        client.record_token(&operator, &ballot_hash);
+        client.record_vote(&operator, &ballot_hash);
+        assert_eq!(client.get_tokens_issued(&ballot_hash), 1);
+        assert_eq!(client.get_votes_cast(&ballot_hash), 1);
+    }
+
+    #[test]
+    fn test_grant_result_verifier_can_publish() {
+        let (env, client, admin) = setup();
+        let verifier = Address::generate(&env);
+        let ballot_hash = String::from_str(&env, "v_ballot");
+        let result_hash = String::from_str(&env, "cafebabe");
+
+        // Admin creates the ballot first
+        client.record_ballot(&admin, &ballot_hash);
+
+        client.grant_role(&admin, &verifier, &Role::ResultVerifier);
+        assert!(client.has_role(&verifier, &Role::ResultVerifier));
+
+        client.record_result(&verifier, &ballot_hash, &result_hash);
+        assert_eq!(client.get_result_hash(&ballot_hash), Some(result_hash));
+    }
+
+    #[test]
+    #[should_panic(expected = "unauthorized")]
+    fn test_result_verifier_cannot_record_ballot() {
+        let (env, client, admin) = setup();
+        let verifier = Address::generate(&env);
+        let ballot_hash = String::from_str(&env, "bad_ballot");
+
+        client.grant_role(&admin, &verifier, &Role::ResultVerifier);
+        // ResultVerifier must NOT be able to record a ballot
+        client.record_ballot(&verifier, &ballot_hash);
+    }
+
+    #[test]
+    #[should_panic(expected = "unauthorized")]
+    fn test_ballot_operator_cannot_publish_result() {
+        let (env, client, admin) = setup();
+        let operator = Address::generate(&env);
+        let ballot_hash = String::from_str(&env, "op_ballot2");
+        let result_hash = String::from_str(&env, "aabbccdd");
+
+        client.grant_role(&admin, &operator, &Role::BallotOperator);
+        client.record_ballot(&operator, &ballot_hash);
+        // BallotOperator must NOT be able to publish results
+        client.record_result(&operator, &ballot_hash, &result_hash);
+    }
+
+    #[test]
+    fn test_revoke_role_denies_access() {
+        let (env, client, admin) = setup();
+        let operator = Address::generate(&env);
+        let ballot_hash = String::from_str(&env, "revoke_ballot");
+
+        client.grant_role(&admin, &operator, &Role::BallotOperator);
+        client.record_ballot(&operator, &ballot_hash);
+
+        // Revoke and confirm access is removed immediately
+        client.revoke_role(&admin, &operator, &Role::BallotOperator);
+        assert!(!client.has_role(&operator, &Role::BallotOperator));
+    }
+
+    #[test]
+    #[should_panic(expected = "unauthorized")]
+    fn test_revoked_operator_cannot_record_token() {
+        let (env, client, admin) = setup();
+        let operator = Address::generate(&env);
+        let ballot_hash = String::from_str(&env, "revoke_token_ballot");
+
+        client.grant_role(&admin, &operator, &Role::BallotOperator);
+        client.record_ballot(&operator, &ballot_hash);
+        client.revoke_role(&admin, &operator, &Role::BallotOperator);
+
+        // Must panic after revoke
+        client.record_token(&operator, &ballot_hash);
+    }
+
+    #[test]
+    #[should_panic(expected = "unauthorized")]
+    fn test_read_only_cannot_mutate() {
+        let (env, client, admin) = setup();
+        let reader = Address::generate(&env);
+        let ballot_hash = String::from_str(&env, "ro_ballot");
+
+        client.grant_role(&admin, &reader, &Role::ReadOnly);
+        // ReadOnly must never mutate state
+        client.record_ballot(&reader, &ballot_hash);
+    }
+
     #[test]
     fn test_ballot_metadata() {
         let (env, client, admin) = setup();
@@ -1374,5 +1571,63 @@ mod tests {
         // Resuming when not paused should succeed
         client.resume_contract(&admin).unwrap();
         assert!(!client.is_paused());
+    }
+
+    #[test]
+    fn test_address_can_hold_multiple_roles() {
+        let (env, client, admin) = setup();
+        let multi = Address::generate(&env);
+
+        client.grant_role(&admin, &multi, &Role::BallotOperator);
+        client.grant_role(&admin, &multi, &Role::ResultVerifier);
+
+        assert!(client.has_role(&multi, &Role::BallotOperator));
+        assert!(client.has_role(&multi, &Role::ResultVerifier));
+
+        let ballot_hash = String::from_str(&env, "multi_ballot");
+        let result_hash = String::from_str(&env, "multihash");
+        client.record_ballot(&multi, &ballot_hash);
+        client.record_result(&multi, &ballot_hash, &result_hash);
+    }
+
+    #[test]
+    fn test_grant_is_idempotent() {
+        let (env, client, admin) = setup();
+        let operator = Address::generate(&env);
+
+        // Double-grant must not error
+        client.grant_role(&admin, &operator, &Role::BallotOperator);
+        client.grant_role(&admin, &operator, &Role::BallotOperator);
+        assert!(client.has_role(&operator, &Role::BallotOperator));
+    }
+
+    #[test]
+    #[should_panic(expected = "unauthorized")]
+    fn test_non_admin_cannot_grant_role() {
+        let (env, client, _admin) = setup();
+        let rogue = Address::generate(&env);
+        let target = Address::generate(&env);
+        // Non-admin must not be able to grant roles
+        client.grant_role(&rogue, &target, &Role::BallotOperator);
+    }
+
+    #[test]
+    #[should_panic(expected = "unauthorized")]
+    fn test_non_admin_cannot_revoke_role() {
+        let (env, client, admin) = setup();
+        let operator = Address::generate(&env);
+        let rogue = Address::generate(&env);
+
+        client.grant_role(&admin, &operator, &Role::BallotOperator);
+        // Non-admin must not be able to revoke
+        client.revoke_role(&rogue, &operator, &Role::BallotOperator);
+    }
+
+    #[test]
+    fn test_admin_always_has_full_access() {
+        let (_env, client, admin) = setup();
+        assert!(client.has_role(&admin, &Role::BallotOperator));
+        assert!(client.has_role(&admin, &Role::ResultVerifier));
+        assert!(client.has_role(&admin, &Role::ReadOnly));
     }
 }
