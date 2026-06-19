@@ -19,7 +19,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String, log
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String
 };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -627,8 +627,6 @@ impl AnonVoteContract {
 
     fn ballot_expiration(env: &Env, ballot_id_hash: &String) {
         let metadata = Self::get_ballot_metadata(env, ballot_id_hash.clone()).unwrap();
-        log!(&env, "metadata:", metadata);
-        log!(&env, "env.ledger().timestamp():", env.ledger().timestamp());
         if metadata.expiration_time < env.ledger().timestamp() {
             let key = DataKey::BallotExpired(ballot_id_hash.clone());
             let expired = env.storage().persistent().get(&key).unwrap_or(false);
