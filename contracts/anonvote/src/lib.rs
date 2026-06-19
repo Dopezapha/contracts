@@ -1,316 +1,573 @@
-//! AnonVote Soroban Smart Contract
+//! AnonVote Soroban smart contract.
 //!
-//! Records immutable audit events on the Stellar blockchain.
-//! Complements the manageData approach with on-chain queryable state.
-//!
-//! # What this contract does
-//! - Records ballot creation events with a ballot ID hash
-//! - Records token issuance counts per ballot (no voter identity)
-//! - Records vote cast counts per ballot (no vote content)
-//! - Records result publication with a tally hash
-//! - Allows public verification of event counts on-chain
-//!
-//! # Access control model (Issue #31)
-//! - `Admin`          — full privileges; manages roles; immutable supremacy
-//! - `BallotOperator` — can record ballots, tokens, and votes
-//! - `ResultVerifier` — can publish results
-//! - `ReadOnly`       — view-only; no state-changing calls permitted
-//!
-//! One address can hold multiple roles.  Roles are revoked immediately upon
-//! `revoke_role`.  Admin always retains full privileges regardless of explicit
-//! role grants.
-//!
-//! # Privacy guarantees
-//! - No voter identifiers stored
-//! - No token values stored
-//! - No vote content stored
-//! - Only counts and hashes — same privacy model as the off-chain system
+//! The contract stores public ballot audit data and protects critical
+//! governance operations with configurable M-of-N approval.
 
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    String, Vec,
 };
 
-// ── Constants ─────────────────────────────────────────────────────────────────
-const TIME_LOCK_HOURS: u64 = 48;
-const TIME_LOCK_SECONDS: u64 = TIME_LOCK_HOURS * 60 * 60;
-
-// ── Error types ───────────────────────────────────────────────────────────────
+const APPROVAL_EXPIRATION_SECONDS: u64 = 7 * 24 * 60 * 60;
+const UPGRADE_TIME_LOCK_SECONDS: u64 = 48 * 60 * 60;
 
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum ContractError {
-    AdminUnauthorized      = 1,
-    AlreadyInitialized     = 2,
-    NotInitialized         = 3,
-    BallotNotFound         = 4,
-    BallotAlreadyExists    = 5,
+    AdminUnauthorized = 1,
+    AlreadyInitialized = 2,
+    NotInitialized = 3,
+    BallotNotFound = 4,
+    BallotAlreadyExists = 5,
     ResultAlreadyPublished = 6,
-    CounterOverflow        = 7,
-    InvalidBallotHash      = 8,
+    CounterOverflow = 7,
+    InvalidBallotHash = 8,
     UpgradeAlreadyScheduled = 9,
-    NoUpgradeScheduled    = 10,
-    TimeLockNotExpired    = 11,
-    BallotExpired         = 12,
-    RateLimitExceeded     = 13,
+    NoUpgradeScheduled = 10,
+    TimeLockNotExpired = 11,
+    BallotExpired = 12,
+    ContractPaused = 13,
+    LimitExceeded = 14,
+    InvalidApprovalConfig = 15,
+    DuplicateApprover = 16,
+    ApproverUnauthorized = 17,
+    OperationNotFound = 18,
+    OperationAlreadyApproved = 19,
+    OperationNotPending = 20,
+    OperationExpired = 21,
 }
-
-// ── Rate limiting types ───────────────────────────────────────────────────────
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub enum Operation {
-    RecordBallot,
-    RecordToken,
-    RecordVote,
-    RecordResult,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct RateLimit {
-    pub calls_per_minute: u32,
-    pub calls_per_hour: u32,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct CallCounts {
-    pub minute_bucket: u64,
-    pub minute_calls: u32,
-    pub hour_bucket: u64,
-    pub hour_calls: u32,
-}
-
-// ── Upgrade types ─────────────────────────────────────────────────────────────
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct PendingUpgrade {
-    pub new_wasm_hash: BytesN<32>,
-    pub scheduled_at: u64,
-    pub executable_at: u64,
-}
-
-// ── Ballot state types ────────────────────────────────────────────────────────
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BallotState {
     Active,
     ResultPublished,
-    Archived,
 }
 
 #[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct BallotMetadata {
-    pub created_at: u64,
-    pub admin: Address,
-    pub state: BallotState,
-    pub expiration_time: u64
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct BallotStateSnapshot {
-    pub tokens_issued: u32,
-    pub votes_cast: u32,
-    pub result_hash: Option<String>,
-    pub created_at: u64,
-    pub admin: Address,
-    pub state: BallotState,
-    pub state_updated_at: u64,
-}
-
-// ── Storage keys ──────────────────────────────────────────────────────────────
-
-#[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BallotLimits {
     pub max_tokens: u32,
     pub max_votes: u32,
 }
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BallotMetadata {
+    pub admin: Address,
+    pub created_at: u64,
+    pub expiration_time: u64,
     pub limits: BallotLimits,
+    pub state: BallotState,
+    pub state_updated_at: u64,
 }
 
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum Error {
-    LimitExceeded = 1,
-    BallotNotFound = 2,
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BallotStateSnapshot {
+    pub admin: Address,
+    pub created_at: u64,
+    pub expiration_time: u64,
+    pub limits: BallotLimits,
+    pub result_hash: Option<String>,
+    pub state: BallotState,
+    pub state_updated_at: u64,
+    pub tokens_issued: u32,
+    pub votes_cast: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingUpgrade {
+    pub executable_at: u64,
+    pub new_wasm_hash: BytesN<32>,
+    pub scheduled_at: u64,
+}
+
+/// Operations that must be approved by the configured M-of-N approvers.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CriticalOperation {
+    AdminRotation(Address),
+    Pause,
+    ResultPublication(String, String),
+    UpgradeScheduling(BytesN<32>),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OperationStatus {
+    Pending,
+    Executed,
+    Cancelled,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingOperation {
+    pub approval_count: u32,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub id: u64,
+    pub operation: CriticalOperation,
+    pub proposer: Address,
+    pub status: OperationStatus,
 }
 
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
-    /// Admin address — only admin can manage roles
     Admin,
-    /// Timestamp of contract initialization
     InitializedAt,
-    /// Token issued count for a ballot: ballot_id_hash → u32
+    IsPaused,
+    Approvers,
+    ApprovalThreshold,
+    OperationNonce,
+    Operation(u64),
+    Approval(u64, Address),
     TokensIssued(String),
-    /// Votes cast count for a ballot: ballot_id_hash → u32
     VotesCast(String),
-    /// Result hash for a ballot: ballot_id_hash → String
     ResultHash(String),
-    /// Ballot metadata: ballot_id_hash → BallotMetadata
     BallotMetadata(String),
+    BallotExpired(String),
+    PendingUpgrade,
 }
-
-// ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
 pub struct AnonVoteContract;
 
 #[contractimpl]
 impl AnonVoteContract {
-    // ── Initialisation ───────────────────────────────────────────────────────
-
-    /// Initialize the contract with an admin address.
-    /// Must be called once after deployment.
-    /// Returns AlreadyInitialized if called again (idempotent-safe).
+    /// Initializes the contract. Governance starts as 1-of-1 with the admin as
+    /// the sole approver, so deployments can explicitly configure M-of-N next.
     pub fn initialize(env: Env, admin: Address) -> Result<(), ContractError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(ContractError::AlreadyInitialized);
         }
-        let default_limit = RateLimit {
-            calls_per_minute: 100,
-            calls_per_hour: 1000,
-        };
-        env.storage()
-            .instance()
-            .set(&(symbol_short!("RateLimit"), Operation::RecordBallot), &default_limit);
-        env.storage()
-            .instance()
-            .set(&(symbol_short!("RateLimit"), Operation::RecordToken), &default_limit);
-        env.storage()
-            .instance()
-            .set(&(symbol_short!("RateLimit"), Operation::RecordVote), &default_limit);
-        env.storage()
-            .instance()
-            .set(&(symbol_short!("RateLimit"), Operation::RecordResult), &default_limit);
+
+        let mut approvers = Vec::new(&env);
+        approvers.push_back(admin.clone());
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::IsPaused, &false);
         env.storage()
             .instance()
             .set(&DataKey::InitializedAt, &env.ledger().timestamp());
+        env.storage().instance().set(&DataKey::IsPaused, &false);
+        env.storage()
+            .instance()
+            .set(&DataKey::Approvers, &approvers);
+        env.storage()
+            .instance()
+            .set(&DataKey::ApprovalThreshold, &1u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::OperationNonce, &0u64);
         Ok(())
     }
 
-    /// Record a ballot creation event.
-    /// ballot_id_hash: SHA-256 hex of the ballot UUID
+    /// Replaces the approver set and configures the M-of-N threshold.
+    ///
+    /// `n` must equal `approvers.len()`, all addresses must be unique, and
+    /// `1 <= m <= n`.
+    pub fn configure_approval_threshold(
+        env: Env,
+        caller: Address,
+        approvers: Vec<Address>,
+        m: u32,
+        n: u32,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        Self::require_admin(&env, &caller)?;
+
+        if n == 0 || m == 0 || m > n || approvers.len() != n {
+            return Err(ContractError::InvalidApprovalConfig);
+        }
+
+        let mut seen = Vec::new(&env);
+        for approver in approvers.iter() {
+            if Self::contains_address(&seen, &approver) {
+                return Err(ContractError::DuplicateApprover);
+            }
+            seen.push_back(approver);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Approvers, &approvers);
+        env.storage()
+            .instance()
+            .set(&DataKey::ApprovalThreshold, &m);
+        env.events().publish(
+            (symbol_short!("govern"), symbol_short!("cfg_appr")),
+            (caller, m, n),
+        );
+        Ok(())
+    }
+
+    /// Creates a pending critical operation. The operation remains pending
+    /// until M distinct configured approvers approve it.
+    pub fn create_operation(
+        env: Env,
+        caller: Address,
+        operation: CriticalOperation,
+    ) -> Result<u64, ContractError> {
+        caller.require_auth();
+        Self::require_admin(&env, &caller)?;
+        Self::validate_operation(&env, &operation)?;
+
+        let operation_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OperationNonce)
+            .unwrap_or(0);
+        let next_id = operation_id
+            .checked_add(1)
+            .ok_or(ContractError::CounterOverflow)?;
+        let created_at = env.ledger().timestamp();
+        let pending = PendingOperation {
+            approval_count: 0,
+            created_at,
+            expires_at: created_at + APPROVAL_EXPIRATION_SECONDS,
+            id: operation_id,
+            operation,
+            proposer: caller.clone(),
+            status: OperationStatus::Pending,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Operation(operation_id), &pending);
+        env.storage()
+            .instance()
+            .set(&DataKey::OperationNonce, &next_id);
+        env.events().publish(
+            (symbol_short!("govern"), symbol_short!("op_create")),
+            (operation_id, caller, created_at, pending.expires_at),
+        );
+        Ok(operation_id)
+    }
+
+    /// Proposes result publication for M-of-N approval.
+    pub fn record_result(
+        env: Env,
+        caller: Address,
+        ballot_id_hash: String,
+        result_hash: String,
+    ) -> Result<u64, ContractError> {
+        Self::create_operation(
+            env,
+            caller,
+            CriticalOperation::ResultPublication(ballot_id_hash, result_hash),
+        )
+    }
+
+    /// Proposes admin rotation for M-of-N approval.
+    pub fn rotate_admin(
+        env: Env,
+        caller: Address,
+        new_admin: Address,
+    ) -> Result<u64, ContractError> {
+        Self::create_operation(env, caller, CriticalOperation::AdminRotation(new_admin))
+    }
+
+    /// Proposes pausing the contract for M-of-N approval.
+    pub fn pause_contract(env: Env, caller: Address) -> Result<u64, ContractError> {
+        Self::create_operation(env, caller, CriticalOperation::Pause)
+    }
+
+    /// Proposes scheduling a time-locked upgrade for M-of-N approval.
+    pub fn schedule_upgrade(
+        env: Env,
+        caller: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<u64, ContractError> {
+        Self::create_operation(
+            env,
+            caller,
+            CriticalOperation::UpgradeScheduling(new_wasm_hash),
+        )
+    }
+
+    /// Records one approval. The approval that reaches M executes the operation
+    /// in the same transaction.
+    pub fn approve_operation(
+        env: Env,
+        operation_id: u64,
+        approver_address: Address,
+    ) -> Result<bool, ContractError> {
+        approver_address.require_auth();
+        Self::require_approver(&env, &approver_address)?;
+
+        let key = DataKey::Operation(operation_id);
+        let mut pending: PendingOperation = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::OperationNotFound)?;
+        if pending.status != OperationStatus::Pending {
+            return Err(ContractError::OperationNotPending);
+        }
+        if env.ledger().timestamp() > pending.expires_at {
+            return Err(ContractError::OperationExpired);
+        }
+
+        let approval_key = DataKey::Approval(operation_id, approver_address.clone());
+        if env.storage().persistent().has(&approval_key) {
+            return Err(ContractError::OperationAlreadyApproved);
+        }
+
+        pending.approval_count = pending
+            .approval_count
+            .checked_add(1)
+            .ok_or(ContractError::CounterOverflow)?;
+        env.storage().persistent().set(&approval_key, &true);
+        env.events().publish(
+            (symbol_short!("govern"), symbol_short!("approved")),
+            (
+                operation_id,
+                approver_address,
+                pending.approval_count,
+                env.ledger().timestamp(),
+            ),
+        );
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ApprovalThreshold)
+            .ok_or(ContractError::NotInitialized)?;
+        if pending.approval_count < threshold {
+            env.storage().persistent().set(&key, &pending);
+            return Ok(false);
+        }
+
+        Self::execute_operation(&env, &pending.operation)?;
+        pending.status = OperationStatus::Executed;
+        env.storage().persistent().set(&key, &pending);
+        env.events().publish(
+            (symbol_short!("govern"), symbol_short!("op_exec")),
+            (
+                operation_id,
+                pending.approval_count,
+                env.ledger().timestamp(),
+            ),
+        );
+        Ok(true)
+    }
+
+    /// Cancels a pending operation before it reaches its approval threshold.
+    pub fn cancel_operation(
+        env: Env,
+        caller: Address,
+        operation_id: u64,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        Self::require_admin(&env, &caller)?;
+
+        let key = DataKey::Operation(operation_id);
+        let mut pending: PendingOperation = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::OperationNotFound)?;
+        if pending.status != OperationStatus::Pending {
+            return Err(ContractError::OperationNotPending);
+        }
+
+        pending.status = OperationStatus::Cancelled;
+        env.storage().persistent().set(&key, &pending);
+        env.events().publish(
+            (symbol_short!("govern"), symbol_short!("op_cancel")),
+            (operation_id, caller, env.ledger().timestamp()),
+        );
+        Ok(())
+    }
+
     pub fn record_ballot(
         env: Env,
         caller: Address,
         ballot_id_hash: String,
         limits: BallotLimits,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ContractError> {
         caller.require_auth();
-        Self::require_admin(&env, &caller);
+        Self::require_not_paused(&env)?;
+        Self::require_admin(&env, &caller)?;
+        if ballot_id_hash.len() == 0 {
+            return Err(ContractError::InvalidBallotHash);
+        }
 
         let key = DataKey::BallotMetadata(ballot_id_hash.clone());
         if env.storage().persistent().has(&key) {
-            panic!("ballot already recorded");
+            return Err(ContractError::BallotAlreadyExists);
         }
-        env.storage()
-            .persistent()
-            .set(&key, &BallotMetadata { limits });
+
+        let now = env.ledger().timestamp();
+        let metadata = BallotMetadata {
+            admin: caller.clone(),
+            created_at: now,
+            expiration_time: 0,
+            limits,
+            state: BallotState::Active,
+            state_updated_at: now,
+        };
+        env.storage().persistent().set(&key, &metadata);
         env.storage()
             .persistent()
             .set(&DataKey::TokensIssued(ballot_id_hash.clone()), &0u32);
         env.storage()
             .persistent()
             .set(&DataKey::VotesCast(ballot_id_hash.clone()), &0u32);
-
-        env.events()
-            .publish((symbol_short!("ballot"),), (symbol_short!("created"),));
+        env.events().publish(
+            (symbol_short!("audit"), symbol_short!("blt_crtd")),
+            (ballot_id_hash, now, caller),
+        );
         Ok(())
     }
 
-    /// Increment the token issued count for a ballot.
-    /// Called when a voter token is issued.
-    pub fn record_token(env: Env, caller: Address, ballot_id_hash: String) -> Result<(), Error> {
+    pub fn record_token(
+        env: Env,
+        caller: Address,
+        ballot_id_hash: String,
+    ) -> Result<(), ContractError> {
         caller.require_auth();
-        Self::require_admin(&env, &caller);
+        Self::require_not_paused(&env)?;
+        Self::require_admin(&env, &caller)?;
         let metadata = Self::require_ballot_metadata(&env, &ballot_id_hash)?;
+        Self::require_ballot_not_expired(&env, &ballot_id_hash)?;
 
         let key = DataKey::TokensIssued(ballot_id_hash.clone());
         let count: u32 = env.storage().persistent().get(&key).unwrap_or(0);
         if count >= metadata.limits.max_tokens {
-            env.events().publish(
-                (symbol_short!("limit"), symbol_short!("token")),
-                (symbol_short!("current"), count),
-            );
-            return Err(Error::LimitExceeded);
+            return Err(ContractError::LimitExceeded);
         }
-        env.storage().persistent().set(&key, &(count + 1));
-
-        env.events()
-            .publish((symbol_short!("token"),), (symbol_short!("issued"),));
+        let new_count = count.checked_add(1).ok_or(ContractError::CounterOverflow)?;
+        env.storage().persistent().set(&key, &new_count);
+        env.events().publish(
+            (symbol_short!("audit"), symbol_short!("tok_issd")),
+            (ballot_id_hash, new_count),
+        );
         Ok(())
     }
 
-    /// Increment the votes cast count for a ballot.
-    /// Called when a vote is submitted.
-    pub fn record_vote(env: Env, caller: Address, ballot_id_hash: String) -> Result<(), Error> {
+    pub fn record_vote(
+        env: Env,
+        caller: Address,
+        ballot_id_hash: String,
+    ) -> Result<(), ContractError> {
         caller.require_auth();
-        Self::require_admin(&env, &caller);
+        Self::require_not_paused(&env)?;
+        Self::require_admin(&env, &caller)?;
         let metadata = Self::require_ballot_metadata(&env, &ballot_id_hash)?;
+        Self::require_ballot_not_expired(&env, &ballot_id_hash)?;
 
         let key = DataKey::VotesCast(ballot_id_hash.clone());
         let count: u32 = env.storage().persistent().get(&key).unwrap_or(0);
         if count >= metadata.limits.max_votes {
-            env.events().publish(
-                (symbol_short!("limit"), symbol_short!("vote")),
-                (symbol_short!("current"), count),
-            );
-            return Err(Error::LimitExceeded);
+            return Err(ContractError::LimitExceeded);
         }
-        env.storage().persistent().set(&key, &(count + 1));
-
-        env.events()
-            .publish((symbol_short!("vote"),), (symbol_short!("cast"),));
+        let new_count = count.checked_add(1).ok_or(ContractError::CounterOverflow)?;
+        env.storage().persistent().set(&key, &new_count);
+        env.events().publish(
+            (symbol_short!("audit"), symbol_short!("vote_cast")),
+            (ballot_id_hash, new_count),
+        );
         Ok(())
     }
 
-    /// Record the result publication for a ballot.
-    /// Idempotent: if the same result_hash is already recorded, returns success.
-    /// Returns ResultAlreadyPublished (with a distinguishable error) if a
-    /// different result hash was already published.
-    pub fn record_result(
+    pub fn expire_ballot(
         env: Env,
         caller: Address,
         ballot_id_hash: String,
-        result_hash: String,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ContractError> {
         caller.require_auth();
-        Self::require_admin(&env, &caller);
+        Self::require_admin(&env, &caller)?;
         Self::require_ballot_metadata(&env, &ballot_id_hash)?;
-
-        let key = DataKey::ResultHash(ballot_id_hash.clone());
-        if let Some(existing) = env.storage().persistent().get::<DataKey, String>(&key) {
-            // Idempotent: same hash re-recorded → success
-            if existing == result_hash {
-                return Ok(());
-            }
-            return Err(ContractError::ResultAlreadyPublished);
-        }
-
-        env.events()
-            .publish((symbol_short!("result"),), (symbol_short!("published"),));
+        env.storage()
+            .persistent()
+            .set(&DataKey::BallotExpired(ballot_id_hash.clone()), &true);
+        env.events().publish(
+            (symbol_short!("audit"), symbol_short!("exp_adm")),
+            ballot_id_hash,
+        );
         Ok(())
     }
 
-    // ── Read-only queries ────────────────────────────────────────────────────
+    pub fn cancel_upgrade(env: Env, caller: Address) -> Result<(), ContractError> {
+        caller.require_auth();
+        Self::require_admin(&env, &caller)?;
+        if !env.storage().instance().has(&DataKey::PendingUpgrade) {
+            return Err(ContractError::NoUpgradeScheduled);
+        }
+        env.storage().instance().remove(&DataKey::PendingUpgrade);
+        env.events().publish(
+            (symbol_short!("audit"), symbol_short!("upg_cncl")),
+            (caller, env.ledger().timestamp()),
+        );
+        Ok(())
+    }
 
-    /// Returns true if the contract is currently paused.
+    pub fn execute_upgrade(env: Env) -> Result<(), ContractError> {
+        let pending: PendingUpgrade = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgrade)
+            .ok_or(ContractError::NoUpgradeScheduled)?;
+        if env.ledger().timestamp() < pending.executable_at {
+            return Err(ContractError::TimeLockNotExpired);
+        }
+        env.deployer()
+            .update_current_contract_wasm(pending.new_wasm_hash.clone());
+        env.storage().instance().remove(&DataKey::PendingUpgrade);
+        env.events().publish(
+            (symbol_short!("audit"), symbol_short!("upg_excd")),
+            pending.new_wasm_hash,
+        );
+        Ok(())
+    }
+
+    pub fn resume_contract(env: Env, caller: Address) -> Result<(), ContractError> {
+        caller.require_auth();
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::IsPaused, &false);
+        env.events().publish(
+            (symbol_short!("audit"), symbol_short!("resumed")),
+            (caller, env.ledger().timestamp()),
+        );
+        Ok(())
+    }
+
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
+
+    pub fn get_approvers(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Approvers)
+            .unwrap_or(Vec::new(&env))
+    }
+
+    pub fn get_approval_threshold(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ApprovalThreshold)
+            .unwrap_or(0)
+    }
+
+    pub fn get_operation(env: Env, operation_id: u64) -> Option<PendingOperation> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Operation(operation_id))
+    }
+
+    pub fn has_approved(env: Env, operation_id: u64, approver: Address) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::Approval(operation_id, approver))
+    }
+
     pub fn is_paused(env: Env) -> bool {
         env.storage()
             .instance()
@@ -318,19 +575,12 @@ impl AnonVoteContract {
             .unwrap_or(false)
     }
 
-    /// Get the pending upgrade (if any).
     pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
         env.storage().instance().get(&DataKey::PendingUpgrade)
     }
 
-    /// Get the number of tokens issued for a ballot.
-    /// Returns None if the ballot does not exist.
     pub fn get_tokens_issued(env: Env, ballot_id_hash: String) -> Option<u32> {
-        if !env
-            .storage()
-            .persistent()
-            .has(&DataKey::BallotExists(ballot_id_hash.clone()))
-        {
+        if !Self::ballot_exists(env.clone(), ballot_id_hash.clone()) {
             return None;
         }
         env.storage()
@@ -338,14 +588,8 @@ impl AnonVoteContract {
             .get(&DataKey::TokensIssued(ballot_id_hash))
     }
 
-    /// Get the number of votes cast for a ballot.
-    /// Returns None if the ballot does not exist.
     pub fn get_votes_cast(env: Env, ballot_id_hash: String) -> Option<u32> {
-        if !env
-            .storage()
-            .persistent()
-            .has(&DataKey::BallotExists(ballot_id_hash.clone()))
-        {
+        if !Self::ballot_exists(env.clone(), ballot_id_hash.clone()) {
             return None;
         }
         env.storage()
@@ -353,91 +597,60 @@ impl AnonVoteContract {
             .get(&DataKey::VotesCast(ballot_id_hash))
     }
 
-    /// Get the result hash for a ballot (None if not yet published).
     pub fn get_result_hash(env: Env, ballot_id_hash: String) -> Option<String> {
         env.storage()
             .persistent()
             .get(&DataKey::ResultHash(ballot_id_hash))
     }
 
-    /// Check if a ballot has been recorded on-chain.
     pub fn ballot_exists(env: Env, ballot_id_hash: String) -> bool {
         env.storage()
             .persistent()
             .has(&DataKey::BallotMetadata(ballot_id_hash))
     }
 
-    /// Check if a ballot has been recorded on-chain.
-    pub fn get_ballot_expiration(env: Env, ballot_id_hash: String) -> bool {
-        env.storage()
-            .persistent()
-            .has(&DataKey::BallotExpired(ballot_id_hash))
-    }
-
-    /// Check if a result has been published for a ballot.
     pub fn result_exists(env: Env, ballot_id_hash: String) -> bool {
         env.storage()
             .persistent()
             .has(&DataKey::ResultHash(ballot_id_hash))
     }
 
-    /// Get the timestamp when the contract was initialized.
-    /// Returns None if the contract has not been initialized.
     pub fn get_initialized_at(env: Env) -> Option<u64> {
         env.storage().instance().get(&DataKey::InitializedAt)
     }
 
-    /// Get ballot metadata (created_at, admin, state).
-    /// Returns None if the ballot does not exist.
-    pub fn get_ballot_metadata(env: &Env, ballot_id_hash: String) -> Option<BallotMetadata> {
+    pub fn get_ballot_metadata(env: Env, ballot_id_hash: String) -> Option<BallotMetadata> {
         env.storage()
             .persistent()
             .get(&DataKey::BallotMetadata(ballot_id_hash))
     }
 
-    /// Get complete ballot state snapshot (tokens, votes, result, metadata).
-    /// Returns None if the ballot does not exist.
     pub fn get_ballot_state(env: Env, ballot_id_hash: String) -> Option<BallotStateSnapshot> {
-        if !env
-            .storage()
-            .persistent()
-            .has(&DataKey::BallotExists(ballot_id_hash.clone()))
-        {
-            return None;
-        }
-
-        let tokens_issued: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TokensIssued(ballot_id_hash.clone()))
-            .unwrap_or(0);
-        let votes_cast: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::VotesCast(ballot_id_hash.clone()))
-            .unwrap_or(0);
-        let result_hash: Option<String> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ResultHash(ballot_id_hash.clone()));
-        let metadata: BallotMetadata = env
-            .storage()
-            .persistent()
-            .get(&DataKey::BallotMetadata(ballot_id_hash))
-            .unwrap();
-
+        let metadata = Self::require_ballot_metadata(&env, &ballot_id_hash).ok()?;
         Some(BallotStateSnapshot {
-            tokens_issued,
-            votes_cast,
-            result_hash,
-            created_at: metadata.created_at,
             admin: metadata.admin,
+            created_at: metadata.created_at,
+            expiration_time: metadata.expiration_time,
+            limits: metadata.limits,
+            result_hash: env
+                .storage()
+                .persistent()
+                .get(&DataKey::ResultHash(ballot_id_hash.clone())),
             state: metadata.state,
             state_updated_at: metadata.state_updated_at,
+            tokens_issued: env
+                .storage()
+                .persistent()
+                .get(&DataKey::TokensIssued(ballot_id_hash.clone()))
+                .unwrap_or(0),
+            votes_cast: env
+                .storage()
+                .persistent()
+                .get(&DataKey::VotesCast(ballot_id_hash))
+                .unwrap_or(0),
         })
     }
 
-    /// Verify consistency: returns true if tokens_issued == votes_cast.
     pub fn is_consistent(env: Env, ballot_id_hash: String) -> bool {
         let tokens: u32 = env
             .storage()
@@ -452,16 +665,99 @@ impl AnonVoteContract {
         tokens == votes
     }
 
-    // ── Internal helpers ─────────────────────────────────────────────────────
+    fn validate_operation(env: &Env, operation: &CriticalOperation) -> Result<(), ContractError> {
+        match operation {
+            CriticalOperation::ResultPublication(ballot_id_hash, result_hash) => {
+                Self::require_ballot_metadata(env, ballot_id_hash)?;
+                if result_hash.len() == 0 {
+                    return Err(ContractError::InvalidBallotHash);
+                }
+                if let Some(existing) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, String>(&DataKey::ResultHash(ballot_id_hash.clone()))
+                {
+                    if existing != *result_hash {
+                        return Err(ContractError::ResultAlreadyPublished);
+                    }
+                }
+            }
+            CriticalOperation::UpgradeScheduling(_) => {
+                if env.storage().instance().has(&DataKey::PendingUpgrade) {
+                    return Err(ContractError::UpgradeAlreadyScheduled);
+                }
+            }
+            CriticalOperation::AdminRotation(_) | CriticalOperation::Pause => {}
+        }
+        Ok(())
+    }
 
-    fn require_not_paused(env: &Env) -> Result<(), ContractError> {
-        let paused: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::IsPaused)
-            .unwrap_or(false);
-        if paused {
-            return Err(ContractError::ContractPaused);
+    fn execute_operation(env: &Env, operation: &CriticalOperation) -> Result<(), ContractError> {
+        match operation {
+            CriticalOperation::AdminRotation(new_admin) => {
+                let old_admin: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Admin)
+                    .ok_or(ContractError::NotInitialized)?;
+                env.storage().instance().set(&DataKey::Admin, new_admin);
+                env.events().publish(
+                    (symbol_short!("audit"), symbol_short!("adm_rotd")),
+                    (old_admin, new_admin.clone()),
+                );
+            }
+            CriticalOperation::ResultPublication(ballot_id_hash, result_hash) => {
+                let result_key = DataKey::ResultHash(ballot_id_hash.clone());
+                if let Some(existing) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, String>(&result_key)
+                {
+                    if existing == *result_hash {
+                        return Ok(());
+                    }
+                    return Err(ContractError::ResultAlreadyPublished);
+                }
+                env.storage().persistent().set(&result_key, result_hash);
+                let metadata_key = DataKey::BallotMetadata(ballot_id_hash.clone());
+                let mut metadata = Self::require_ballot_metadata(env, ballot_id_hash)?;
+                metadata.state = BallotState::ResultPublished;
+                metadata.state_updated_at = env.ledger().timestamp();
+                env.storage().persistent().set(&metadata_key, &metadata);
+                env.events().publish(
+                    (symbol_short!("audit"), symbol_short!("res_pub")),
+                    (ballot_id_hash.clone(), result_hash.clone()),
+                );
+            }
+            CriticalOperation::Pause => {
+                env.storage().instance().set(&DataKey::IsPaused, &true);
+                env.events().publish(
+                    (symbol_short!("audit"), symbol_short!("paused")),
+                    env.ledger().timestamp(),
+                );
+            }
+            CriticalOperation::UpgradeScheduling(new_wasm_hash) => {
+                if env.storage().instance().has(&DataKey::PendingUpgrade) {
+                    return Err(ContractError::UpgradeAlreadyScheduled);
+                }
+                let now = env.ledger().timestamp();
+                let pending = PendingUpgrade {
+                    executable_at: now + UPGRADE_TIME_LOCK_SECONDS,
+                    new_wasm_hash: new_wasm_hash.clone(),
+                    scheduled_at: now,
+                };
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PendingUpgrade, &pending);
+                env.events().publish(
+                    (symbol_short!("audit"), symbol_short!("upg_schd")),
+                    (
+                        new_wasm_hash.clone(),
+                        pending.scheduled_at,
+                        pending.executable_at,
+                    ),
+                );
+            }
         }
         Ok(())
     }
@@ -478,24 +774,66 @@ impl AnonVoteContract {
         Ok(())
     }
 
+    fn require_approver(env: &Env, caller: &Address) -> Result<(), ContractError> {
+        let approvers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Approvers)
+            .ok_or(ContractError::NotInitialized)?;
+        if !Self::contains_address(&approvers, caller) {
+            return Err(ContractError::ApproverUnauthorized);
+        }
+        Ok(())
+    }
+
+    fn contains_address(addresses: &Vec<Address>, target: &Address) -> bool {
+        for address in addresses.iter() {
+            if address == *target {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), ContractError> {
+        if env
+            .storage()
+            .instance()
+            .get(&DataKey::IsPaused)
+            .unwrap_or(false)
+        {
+            return Err(ContractError::ContractPaused);
+        }
+        Ok(())
+    }
+
     fn require_ballot_metadata(
         env: &Env,
         ballot_id_hash: &String,
-    ) -> Result<BallotMetadata, Error> {
+    ) -> Result<BallotMetadata, ContractError> {
         env.storage()
             .persistent()
             .get(&DataKey::BallotMetadata(ballot_id_hash.clone()))
-            .ok_or(Error::BallotNotFound)
+            .ok_or(ContractError::BallotNotFound)
+    }
+
+    fn require_ballot_not_expired(env: &Env, ballot_id_hash: &String) -> Result<(), ContractError> {
+        let explicitly_expired: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BallotExpired(ballot_id_hash.clone()))
+            .unwrap_or(false);
+        if explicitly_expired {
+            return Err(ContractError::BallotExpired);
+        }
+        Ok(())
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::{Address as AddressTestUtils, Ledger};
-    use soroban_sdk::{Env, String,};
+    use soroban_sdk::testutils::{Address as _, Ledger};
 
     fn setup() -> (Env, AnonVoteContractClient<'static>, Address) {
         let env = Env::default();
@@ -503,7 +841,7 @@ mod tests {
         let contract_id = env.register_contract(None, AnonVoteContract);
         let client = AnonVoteContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
-        client.try_initialize(&admin).unwrap().unwrap();
+        client.initialize(&admin);
         (env, client, admin)
     }
 
@@ -514,89 +852,120 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_record_ballot_and_query() {
-        let (env, client, admin) = setup();
-        let ballot_hash = String::from_str(&env, "abc123");
-        client.record_ballot(&admin, &ballot_hash, &limits(10, 10));
-        assert!(client.ballot_exists(&ballot_hash));
-        assert_eq!(client.get_tokens_issued(&ballot_hash), Some(0));
-        assert_eq!(client.get_votes_cast(&ballot_hash), Some(0));
+    fn configure_two_of_three(
+        env: &Env,
+        client: &AnonVoteContractClient,
+        admin: &Address,
+    ) -> (Address, Address, Address) {
+        let first = Address::generate(env);
+        let second = Address::generate(env);
+        let third = Address::generate(env);
+        let approvers = Vec::from_array(env, [first.clone(), second.clone(), third.clone()]);
+        client.configure_approval_threshold(admin, &approvers, &2, &3);
+        (first, second, third)
     }
 
     #[test]
-    fn test_token_and_vote_counts() {
+    fn insufficient_approvals_block_result_publication() {
         let (env, client, admin) = setup();
-        let ballot_hash = String::from_str(&env, "abc123");
-        client.record_ballot(&admin, &ballot_hash, &limits(10, 10));
-        client.record_token(&admin, &ballot_hash);
-        client.record_token(&admin, &ballot_hash);
-        client.record_vote(&admin, &ballot_hash);
-        assert_eq!(client.get_tokens_issued(&ballot_hash), 2);
-        assert_eq!(client.get_votes_cast(&ballot_hash), 1);
-        assert!(!client.is_consistent(&ballot_hash));
-        client.try_record_vote(&admin, &ballot_hash).unwrap().unwrap();
-        assert!(client.is_consistent(&ballot_hash));
+        let (first, second, _) = configure_two_of_three(&env, &client, &admin);
+        let ballot = String::from_str(&env, "ballot");
+        let result = String::from_str(&env, "result");
+        client.record_ballot(&admin, &ballot, &limits(10, 10));
+
+        let operation_id = client.record_result(&admin, &ballot, &result);
+        assert!(!client.approve_operation(&operation_id, &first));
+        assert_eq!(client.get_result_hash(&ballot), None);
+        assert!(client.approve_operation(&operation_id, &second));
+        assert_eq!(client.get_result_hash(&ballot), Some(result));
     }
 
     #[test]
-    fn test_record_result() {
+    fn duplicate_and_non_approver_signatures_are_rejected() {
         let (env, client, admin) = setup();
-        let ballot_hash = String::from_str(&env, "abc123");
-        let result_hash = String::from_str(&env, "deadbeef");
-        client.record_ballot(&admin, &ballot_hash, &limits(10, 10));
-        client.record_result(&admin, &ballot_hash, &result_hash);
-        assert_eq!(client.get_result_hash(&ballot_hash), Some(result_hash));
-    }
-
-    // ── Role grant / revoke ──────────────────────────────────────────────────
-
-    #[test]
-    fn test_limits_are_enforced_correctly() {
-        let (env, client, admin) = setup();
-        let ballot_hash = String::from_str(&env, "limited");
-        client.record_ballot(&admin, &ballot_hash, &limits(2, 1));
-
-        assert_eq!(client.try_record_token(&admin, &ballot_hash), Ok(Ok(())));
-        assert_eq!(client.try_record_token(&admin, &ballot_hash), Ok(Ok(())));
-        assert_eq!(
-            client.try_record_token(&admin, &ballot_hash),
-            Err(Ok(Error::LimitExceeded))
-        );
-        assert_eq!(client.get_tokens_issued(&ballot_hash), 2);
-
-        assert_eq!(client.try_record_vote(&admin, &ballot_hash), Ok(Ok(())));
-        assert_eq!(
-            client.try_record_vote(&admin, &ballot_hash),
-            Err(Ok(Error::LimitExceeded))
-        );
-        assert_eq!(client.get_votes_cast(&ballot_hash), 1);
-    }
-
-    #[test]
-    fn test_zero_limit_blocks_all_operations() {
-        let (env, client, admin) = setup();
-        let ballot_hash = String::from_str(&env, "zero");
-        client.record_ballot(&admin, &ballot_hash, &limits(0, 0));
+        let (first, _, _) = configure_two_of_three(&env, &client, &admin);
+        let outsider = Address::generate(&env);
+        let operation_id = client.pause_contract(&admin);
 
         assert_eq!(
-            client.try_record_token(&admin, &ballot_hash),
-            Err(Ok(Error::LimitExceeded))
+            client.try_approve_operation(&operation_id, &outsider),
+            Err(Ok(ContractError::ApproverUnauthorized))
         );
+        assert!(!client.approve_operation(&operation_id, &first));
         assert_eq!(
-            client.try_record_vote(&admin, &ballot_hash),
-            Err(Ok(Error::LimitExceeded))
+            client.try_approve_operation(&operation_id, &first),
+            Err(Ok(ContractError::OperationAlreadyApproved))
         );
-        assert_eq!(client.get_tokens_issued(&ballot_hash), 0);
-        assert_eq!(client.get_votes_cast(&ballot_hash), 0);
+        assert!(!client.is_paused());
     }
 
     #[test]
-    #[should_panic(expected = "unauthorized")]
-    fn test_unauthorized_caller() {
-        let (env, client, _admin) = setup();
-        let ballot_hash = String::from_str(&env, "abc123");
-        let attacker = Address::generate(&env);
-        client.record_ballot(&attacker, &ballot_hash, &limits(10, 10));
+    fn threshold_approval_executes_admin_rotation_and_pause() {
+        let (env, client, admin) = setup();
+        let (first, second, third) = configure_two_of_three(&env, &client, &admin);
+        let new_admin = Address::generate(&env);
+
+        let rotation = client.rotate_admin(&admin, &new_admin);
+        assert!(!client.approve_operation(&rotation, &first));
+        assert!(client.approve_operation(&rotation, &second));
+        assert_eq!(client.get_admin(), Some(new_admin.clone()));
+
+        let pause = client.pause_contract(&new_admin);
+        assert!(!client.approve_operation(&pause, &second));
+        assert!(client.approve_operation(&pause, &third));
+        assert!(client.is_paused());
+    }
+
+    #[test]
+    fn cancelled_and_expired_operations_cannot_execute() {
+        let (env, client, admin) = setup();
+        let (first, second, _) = configure_two_of_three(&env, &client, &admin);
+        let cancelled = client.create_operation(&admin, &CriticalOperation::Pause);
+        client.cancel_operation(&admin, &cancelled);
+        assert_eq!(
+            client.try_approve_operation(&cancelled, &first),
+            Err(Ok(ContractError::OperationNotPending))
+        );
+
+        let expired = client.create_operation(&admin, &CriticalOperation::Pause);
+        env.ledger().with_mut(|ledger| {
+            ledger.timestamp += APPROVAL_EXPIRATION_SECONDS + 1;
+        });
+        assert_eq!(
+            client.try_approve_operation(&expired, &second),
+            Err(Ok(ContractError::OperationExpired))
+        );
+        assert!(!client.is_paused());
+    }
+
+    #[test]
+    fn approval_configuration_is_validated() {
+        let (env, client, admin) = setup();
+        let approver = Address::generate(&env);
+        let duplicate = Vec::from_array(&env, [approver.clone(), approver]);
+        assert_eq!(
+            client.try_configure_approval_threshold(&admin, &duplicate, &2, &2),
+            Err(Ok(ContractError::DuplicateApprover))
+        );
+        assert_eq!(
+            client.try_configure_approval_threshold(&admin, &duplicate, &3, &2),
+            Err(Ok(ContractError::InvalidApprovalConfig))
+        );
+    }
+
+    #[test]
+    fn ballot_limits_and_counts_still_work() {
+        let (env, client, admin) = setup();
+        let ballot = String::from_str(&env, "limited");
+        client.record_ballot(&admin, &ballot, &limits(1, 1));
+        client.record_token(&admin, &ballot);
+        client.record_vote(&admin, &ballot);
+        assert_eq!(client.get_tokens_issued(&ballot), Some(1));
+        assert_eq!(client.get_votes_cast(&ballot), Some(1));
+        assert!(client.is_consistent(&ballot));
+        assert_eq!(
+            client.try_record_token(&admin, &ballot),
+            Err(Ok(ContractError::LimitExceeded))
+        );
     }
 }

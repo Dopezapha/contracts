@@ -32,7 +32,12 @@ The primary Soroban contract. Records immutable audit events on-chain with publi
 | `record_ballot(ballot_id_hash)`              | Register a ballot on-chain. Input is SHA-256 hex of the ballot UUID. |
 | `record_token(ballot_id_hash)`               | Increment the token-issued count for a ballot.                       |
 | `record_vote(ballot_id_hash)`                | Increment the vote-cast count for a ballot.                          |
-| `record_result(ballot_id_hash, result_hash)` | Publish the result hash (SHA-256 of tally JSON). Immutable once set. |
+| `configure_approval_threshold(approvers, m, n)` | Configure the M-of-N governance approver set (admin only). |
+| `record_result(...)`, `rotate_admin(...)`, `pause_contract(...)`, `schedule_upgrade(...)` | Create a pending critical operation and return its operation ID. |
+| `create_operation(operation)`                 | Generic proposal entrypoint for a typed critical operation. |
+| `approve_operation(operation_id, approver)`  | Approve a pending operation; the threshold-reaching approval executes it. |
+| `cancel_operation(operation_id)`              | Cancel a pending critical operation (admin only). |
+| `get_operation(operation_id)`                 | Read operation details, status, expiry, and approval count. |
 | `get_tokens_issued(ballot_id_hash)`          | Read token count (view call).                                        |
 | `get_votes_cast(ballot_id_hash)`             | Read vote count (view call).                                         |
 | `get_result_hash(ballot_id_hash)`            | Read result hash (view call).                                        |
@@ -45,6 +50,13 @@ The primary Soroban contract. Records immutable audit events on-chain with publi
 - No token values stored
 - No vote content stored
 - Only counts and hashes — same privacy model as the off-chain system
+
+**Governance guarantees:**
+
+- Critical operations require distinct approvals from a configurable M-of-N address set.
+- Pending operations expire after seven days and can be cancelled before execution.
+- Approval, creation, cancellation, and execution events provide an on-chain audit trail.
+- Upgrade scheduling remains subject to its existing 48-hour execution timelock after approval.
 
 ### `service/sorobanService.ts` — TypeScript Service Stub
 
