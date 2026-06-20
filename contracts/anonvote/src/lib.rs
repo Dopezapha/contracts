@@ -115,6 +115,7 @@ pub struct PendingOperation {
     pub operation: CriticalOperation,
     pub proposer: Address,
     pub status: OperationStatus,
+    pub threshold: u32,
 }
 
 #[contracttype]
@@ -128,6 +129,7 @@ pub enum DataKey {
     OperationNonce,
     Operation(u64),
     Approval(u64, Address),
+    OperationApprover(u64, Address),
     TokensIssued(String),
     VotesCast(String),
     ResultHash(String),
@@ -226,6 +228,16 @@ impl AnonVoteContract {
             .checked_add(1)
             .ok_or(ContractError::CounterOverflow)?;
         let created_at = env.ledger().timestamp();
+        let approvers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Approvers)
+            .ok_or(ContractError::NotInitialized)?;
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ApprovalThreshold)
+            .ok_or(ContractError::NotInitialized)?;
         let pending = PendingOperation {
             approval_count: 0,
             created_at,
@@ -234,11 +246,17 @@ impl AnonVoteContract {
             operation,
             proposer: caller.clone(),
             status: OperationStatus::Pending,
+            threshold,
         };
 
         env.storage()
             .persistent()
             .set(&DataKey::Operation(operation_id), &pending);
+        for approver in approvers.iter() {
+            env.storage()
+                .persistent()
+                .set(&DataKey::OperationApprover(operation_id, approver), &true);
+        }
         env.storage()
             .instance()
             .set(&DataKey::OperationNonce, &next_id);
@@ -298,7 +316,6 @@ impl AnonVoteContract {
         approver_address: Address,
     ) -> Result<bool, ContractError> {
         approver_address.require_auth();
-        Self::require_approver(&env, &approver_address)?;
 
         let key = DataKey::Operation(operation_id);
         let mut pending: PendingOperation = env
@@ -311,6 +328,12 @@ impl AnonVoteContract {
         }
         if env.ledger().timestamp() > pending.expires_at {
             return Err(ContractError::OperationExpired);
+        }
+        if !env.storage().persistent().has(&DataKey::OperationApprover(
+            operation_id,
+            approver_address.clone(),
+        )) {
+            return Err(ContractError::ApproverUnauthorized);
         }
 
         let approval_key = DataKey::Approval(operation_id, approver_address.clone());
@@ -333,12 +356,7 @@ impl AnonVoteContract {
             ),
         );
 
-        let threshold: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::ApprovalThreshold)
-            .ok_or(ContractError::NotInitialized)?;
-        if pending.approval_count < threshold {
+        if pending.approval_count < pending.threshold {
             env.storage().persistent().set(&key, &pending);
             return Ok(false);
         }
@@ -394,7 +412,7 @@ impl AnonVoteContract {
         caller.require_auth();
         Self::require_not_paused(&env)?;
         Self::require_admin(&env, &caller)?;
-        if ballot_id_hash.len() == 0 {
+        if ballot_id_hash.is_empty() {
             return Err(ContractError::InvalidBallotHash);
         }
 
@@ -669,7 +687,7 @@ impl AnonVoteContract {
         match operation {
             CriticalOperation::ResultPublication(ballot_id_hash, result_hash) => {
                 Self::require_ballot_metadata(env, ballot_id_hash)?;
-                if result_hash.len() == 0 {
+                if result_hash.is_empty() {
                     return Err(ContractError::InvalidBallotHash);
                 }
                 if let Some(existing) = env
@@ -770,18 +788,6 @@ impl AnonVoteContract {
             .ok_or(ContractError::NotInitialized)?;
         if *caller != admin {
             return Err(ContractError::AdminUnauthorized);
-        }
-        Ok(())
-    }
-
-    fn require_approver(env: &Env, caller: &Address) -> Result<(), ContractError> {
-        let approvers: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Approvers)
-            .ok_or(ContractError::NotInitialized)?;
-        if !Self::contains_address(&approvers, caller) {
-            return Err(ContractError::ApproverUnauthorized);
         }
         Ok(())
     }
@@ -950,6 +956,44 @@ mod tests {
         assert_eq!(
             client.try_configure_approval_threshold(&admin, &duplicate, &3, &2),
             Err(Ok(ContractError::InvalidApprovalConfig))
+        );
+    }
+
+    #[test]
+    fn pending_operation_keeps_its_original_governance_configuration() {
+        let (env, client, admin) = setup();
+        let (first, second, _) = configure_two_of_three(&env, &client, &admin);
+        let operation_id = client.pause_contract(&admin);
+
+        let replacement = Address::generate(&env);
+        let replacement_approvers = Vec::from_array(&env, [replacement.clone()]);
+        client.configure_approval_threshold(&admin, &replacement_approvers, &1, &1);
+
+        assert_eq!(
+            client.try_approve_operation(&operation_id, &replacement),
+            Err(Ok(ContractError::ApproverUnauthorized))
+        );
+        assert!(!client.approve_operation(&operation_id, &first));
+        assert!(client.approve_operation(&operation_id, &second));
+        assert!(client.is_paused());
+    }
+
+    #[test]
+    fn upgrade_is_scheduled_only_after_threshold_approval() {
+        let (env, client, admin) = setup();
+        let (first, second, _) = configure_two_of_three(&env, &client, &admin);
+        let wasm_hash = BytesN::from_array(&env, &[7; 32]);
+
+        let operation_id = client.schedule_upgrade(&admin, &wasm_hash);
+        assert!(!client.approve_operation(&operation_id, &first));
+        assert_eq!(client.get_pending_upgrade(), None);
+
+        assert!(client.approve_operation(&operation_id, &second));
+        let upgrade = client.get_pending_upgrade().unwrap();
+        assert_eq!(upgrade.new_wasm_hash, wasm_hash);
+        assert_eq!(
+            upgrade.executable_at,
+            upgrade.scheduled_at + UPGRADE_TIME_LOCK_SECONDS
         );
     }
 
