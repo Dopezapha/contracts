@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import * as crypto from "crypto";
 import { mockRpc, resetMockRpc, simulationError, simulationSuccess, txSuccess } from "./test-helpers/mockStellarSdk";
 import { FakeLedger } from "./test-helpers/fakeLedger";
 
@@ -15,6 +16,7 @@ import {
   sorobanGetAuditCounts,
   sorobanResultExists,
   sorobanGetAuditReport,
+  sorobanVerifyResultProof,
   SorobanErrorCode,
   type SorobanConfig,
 } from "./sorobanService";
@@ -227,5 +229,79 @@ describe("AnonVote ballot lifecycle (mocked contract, no live network)", () => {
     const report4 = await sorobanGetAuditReport(config, ballotIdHash);
     expect(report4!.state).toBe("ResultPublished");
     expect(report4!.result_hash).toBe("election-result-hash");
+  });
+
+  it("sorobanVerifyResultProof verifies merkle proof workflow", async () => {
+    const config = makeConfig();
+    const ballotIdHash = "ballot-hash-merkle";
+
+    // 1. Create ballot
+    await sorobanRecordBallot(config, ballotIdHash);
+
+    // Prepare Merkle Tree data (2 leaves)
+    const leaf0 = crypto.createHash("sha256").update("vote-0").digest("hex");
+    const leaf1 = crypto.createHash("sha256").update("vote-1").digest("hex");
+
+    const leaf0Buf = Buffer.from(leaf0, "hex");
+    const leaf1Buf = Buffer.from(leaf1, "hex");
+    const parentBuf = Buffer.concat([leaf0Buf, leaf1Buf]);
+    const root = crypto.createHash("sha256").update(parentBuf).digest("hex");
+
+    const proof0 = {
+      vote_hash: leaf0,
+      path: [leaf1],
+      index: 0,
+    };
+
+    // 2. Before publication, verification should return null (ballot result not published)
+    const earlyVerify = await sorobanVerifyResultProof(config, ballotIdHash, proof0, root);
+    expect(earlyVerify).toBeNull();
+
+    // 3. Publish result
+    await sorobanRecordResult(config, ballotIdHash, root);
+
+    // 4. Verify valid proof for leaf 0
+    const verify0 = await sorobanVerifyResultProof(config, ballotIdHash, proof0, root);
+    expect(verify0).toBe(true);
+
+    // 5. Verify valid proof for leaf 1
+    const proof1 = {
+      vote_hash: leaf1,
+      path: [leaf0],
+      index: 1,
+    };
+    const verify1 = await sorobanVerifyResultProof(config, ballotIdHash, proof1, root);
+    expect(verify1).toBe(true);
+
+    // 6. Verify invalid proof (invalid vote hash)
+    const invalidVoteProof = {
+      vote_hash: "00".repeat(32),
+      path: [leaf1],
+      index: 0,
+    };
+    const verifyInvalidVote = await sorobanVerifyResultProof(config, ballotIdHash, invalidVoteProof, root);
+    expect(verifyInvalidVote).toBe(false);
+
+    // 7. Verify invalid proof (invalid sibling path)
+    const invalidPathProof = {
+      vote_hash: leaf0,
+      path: ["00".repeat(32)],
+      index: 0,
+    };
+    const verifyInvalidPath = await sorobanVerifyResultProof(config, ballotIdHash, invalidPathProof, root);
+    expect(verifyInvalidPath).toBe(false);
+
+    // 8. Verify invalid proof (wrong index)
+    const invalidIndexProof = {
+      vote_hash: leaf0,
+      path: [leaf1],
+      index: 1,
+    };
+    const verifyInvalidIndex = await sorobanVerifyResultProof(config, ballotIdHash, invalidIndexProof, root);
+    expect(verifyInvalidIndex).toBe(false);
+
+    // 9. Verify with incorrect root parameter
+    const verifyWrongRoot = await sorobanVerifyResultProof(config, ballotIdHash, proof0, "wrong-root-hex");
+    expect(verifyWrongRoot).toBe(false);
   });
 });

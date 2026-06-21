@@ -120,6 +120,12 @@ export interface BallotAuditReport {
   votes_cast: number;
 }
 
+export interface MerkleProof {
+  vote_hash: string;
+  path: string[];
+  index: number;
+}
+
 export interface SorobanInvokeResult {
   txHash: string;
   success: boolean;
@@ -955,6 +961,32 @@ export async function sorobanGetAuditReport(
     { value: ballotIdHash, type: "string" },
   ]);
   return value as BallotAuditReport | null;
+}
+
+/**
+ * Verify a Merkle proof of a vote against the published result hash.
+ */
+export async function sorobanVerifyResultProof(
+  config: SorobanConfig,
+  ballotIdHash: string,
+  voteMerkleProof: MerkleProof,
+  resultHash: string,
+): Promise<boolean | null> {
+  const contractCheck = validateContractId(config.contractId);
+  if (!contractCheck.valid) return null;
+
+  const voteMerkleProofSc = {
+    index: voteMerkleProof.index,
+    path: voteMerkleProof.path.map(p => Buffer.from(p, "hex")),
+    vote_hash: Buffer.from(voteMerkleProof.vote_hash, "hex"),
+  };
+
+  const { value } = await readContract(config, "verify_result_proof", [
+    { value: ballotIdHash, type: "string" },
+    { value: voteMerkleProofSc, type: "map" },
+    { value: resultHash, type: "string" },
+  ]);
+  return value as boolean | null;
 }
 
 /**

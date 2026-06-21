@@ -6,7 +6,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
     String, Vec,
 };
 
@@ -52,6 +52,14 @@ pub enum BallotState {
 pub struct BallotLimits {
     pub max_tokens: u32,
     pub max_votes: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerkleProof {
+    pub vote_hash: BytesN<32>,
+    pub path: Vec<BytesN<32>>,
+    pub index: u32,
 }
 
 #[contracttype]
@@ -724,6 +732,47 @@ impl AnonVoteContract {
         tokens == votes
     }
 
+    /// Verifies a Merkle proof of a vote against the published result hash.
+    pub fn verify_result_proof(
+        env: Env,
+        ballot_id_hash: String,
+        vote_merkle_proof: MerkleProof,
+        result_hash: String,
+    ) -> Result<bool, ContractError> {
+        let result_key = DataKey::ResultHash(ballot_id_hash.clone());
+        if !env.storage().persistent().has(&result_key) {
+            return Err(ContractError::BallotNotFound);
+        }
+        let stored_result_hash: String = env.storage().persistent().get(&result_key).unwrap();
+
+        let mut current_hash = vote_merkle_proof.vote_hash.clone();
+        let mut idx = vote_merkle_proof.index;
+
+        for sibling in vote_merkle_proof.path.iter() {
+            let mut data = Bytes::new(&env);
+            if idx % 2 == 0 {
+                data.extend_from_array(&current_hash.to_array());
+                data.extend_from_array(&sibling.to_array());
+            } else {
+                data.extend_from_array(&sibling.to_array());
+                data.extend_from_array(&current_hash.to_array());
+            }
+            current_hash = env.crypto().sha256(&data).into();
+            idx /= 2;
+        }
+
+        let computed_root_hex = bytes_to_hex(&env, &current_hash);
+
+        if computed_root_hex != result_hash {
+            return Ok(false);
+        }
+        if stored_result_hash != result_hash {
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
     fn validate_operation(env: &Env, operation: &CriticalOperation) -> Result<(), ContractError> {
         match operation {
             CriticalOperation::ResultPublication(ballot_id_hash, result_hash) => {
@@ -875,6 +924,19 @@ impl AnonVoteContract {
         }
         Ok(())
     }
+}
+
+fn bytes_to_hex(env: &Env, bytes: &BytesN<32>) -> String {
+    let arr = bytes.to_array();
+    let mut buf = [0u8; 64];
+    let hex_chars = b"0123456789abcdef";
+    for i in 0..32 {
+        let byte = arr[i];
+        buf[i * 2] = hex_chars[(byte >> 4) as usize];
+        buf[i * 2 + 1] = hex_chars[(byte & 0xf) as usize];
+    }
+    let rust_str = core::str::from_utf8(&buf).unwrap();
+    String::from_str(env, rust_str)
 }
 
 #[cfg(test)]
@@ -1102,5 +1164,80 @@ mod tests {
         let report4 = client.get_audit_report(&ballot).unwrap();
         assert_eq!(report4.state, BallotState::ResultPublished);
         assert_eq!(report4.result_hash, Some(result));
+    }
+
+    #[test]
+    fn verify_result_proof_works() {
+        let (env, client, admin) = setup();
+        let ballot = String::from_str(&env, "merkle-ballot");
+        client.record_ballot(&admin, &ballot, &limits(10, 10));
+
+        let leaf0_bytes = [1u8; 32];
+        let leaf1_bytes = [2u8; 32];
+        let leaf0 = BytesN::from_array(&env, &leaf0_bytes);
+        let leaf1 = BytesN::from_array(&env, &leaf1_bytes);
+
+        let mut data = Bytes::new(&env);
+        data.extend_from_array(&leaf0_bytes);
+        data.extend_from_array(&leaf1_bytes);
+        let root: BytesN<32> = env.crypto().sha256(&data).into();
+        let root_hex = bytes_to_hex(&env, &root);
+
+        // Try verification before result is published - should fail with BallotNotFound
+        let proof0 = MerkleProof {
+            vote_hash: leaf0.clone(),
+            path: Vec::from_array(&env, [leaf1.clone()]),
+            index: 0,
+        };
+        let res = client.try_verify_result_proof(&ballot, &proof0, &root_hex);
+        assert_eq!(res, Err(Ok(ContractError::BallotNotFound)));
+
+        // Publish result
+        let op_id = client.record_result(&admin, &ballot, &root_hex);
+        client.approve_operation(&op_id, &admin);
+
+        // Verify valid proof for leaf 0
+        assert!(client.verify_result_proof(&ballot, &proof0, &root_hex));
+
+        // Verify valid proof for leaf 1
+        let proof1 = MerkleProof {
+            vote_hash: leaf1.clone(),
+            path: Vec::from_array(&env, [leaf0.clone()]),
+            index: 1,
+        };
+        assert!(client.verify_result_proof(&ballot, &proof1, &root_hex));
+
+        // Verify invalid proof: invalid vote hash
+        let invalid_vote_proof = MerkleProof {
+            vote_hash: BytesN::from_array(&env, &[0u8; 32]),
+            path: Vec::from_array(&env, [leaf1.clone()]),
+            index: 0,
+        };
+        assert!(!client.verify_result_proof(&ballot, &invalid_vote_proof, &root_hex));
+
+        // Verify invalid proof: invalid path (wrong sibling hash)
+        let invalid_path_proof = MerkleProof {
+            vote_hash: leaf0.clone(),
+            path: Vec::from_array(&env, [BytesN::from_array(&env, &[0u8; 32])]),
+            index: 0,
+        };
+        assert!(!client.verify_result_proof(&ballot, &invalid_path_proof, &root_hex));
+
+        // Verify invalid proof: wrong index
+        let invalid_idx_proof = MerkleProof {
+            vote_hash: leaf0.clone(),
+            path: Vec::from_array(&env, [leaf1.clone()]),
+            index: 1,
+        };
+        assert!(!client.verify_result_proof(&ballot, &invalid_idx_proof, &root_hex));
+
+        // Verify mismatching result_hash parameter
+        let wrong_root_hex = String::from_str(&env, "0000000000000000000000000000000000000000000000000000000000000000");
+        assert!(!client.verify_result_proof(&ballot, &proof0, &wrong_root_hex));
+
+        // Verify non-existent ballot
+        let non_existent_ballot = String::from_str(&env, "non-existent-ballot");
+        let res = client.try_verify_result_proof(&non_existent_ballot, &proof0, &root_hex);
+        assert_eq!(res, Err(Ok(ContractError::BallotNotFound)));
     }
 }

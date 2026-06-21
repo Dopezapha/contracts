@@ -13,6 +13,14 @@
  * tested without a live network, per the issue's acceptance criteria.
  */
 
+import * as crypto from "crypto";
+
+interface MerkleProof {
+  vote_hash: Buffer;
+  path: Buffer[];
+  index: number;
+}
+
 type FakeBallot = {
   admin: string;
   tokensIssued: number;
@@ -142,6 +150,43 @@ export class FakeLedger {
             votes_cast: ballot.votesCast,
           },
         };
+      }
+
+      case "verify_result_proof": {
+        const ballotIdHash = get(0) as string;
+        const ballot = this.ballots.get(ballotIdHash);
+        if (!ballot) return { ok: false, contractErrorCode: ContractErrorCode.BallotNotFound };
+        if (ballot.resultHash === null) {
+          return { ok: false, contractErrorCode: ContractErrorCode.BallotNotFound };
+        }
+
+        const proof = get(1) as MerkleProof;
+        const resultHashParam = get(2) as string;
+
+        let currentHash = proof.vote_hash;
+        let idx = proof.index;
+
+        for (const sibling of proof.path) {
+          let data: Buffer;
+          if (idx % 2 === 0) {
+            data = Buffer.concat([currentHash, sibling]);
+          } else {
+            data = Buffer.concat([sibling, currentHash]);
+          }
+          currentHash = crypto.createHash("sha256").update(data).digest();
+          idx = Math.floor(idx / 2);
+        }
+
+        const computedRootHex = currentHash.toString("hex");
+
+        if (computedRootHex !== resultHashParam) {
+          return { ok: true, value: false };
+        }
+        if (ballot.resultHash !== resultHashParam) {
+          return { ok: true, value: false };
+        }
+
+        return { ok: true, value: true };
       }
 
       default:

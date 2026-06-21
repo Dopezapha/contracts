@@ -22,6 +22,7 @@ import {
   validateContractId,
   sorobanRecordResult,
   sorobanResultExists,
+  sorobanVerifyResultProof,
   SorobanErrorCode,
   DEFAULT_RETRY_POLICY,
   type SorobanConfig,
@@ -256,6 +257,43 @@ describe("sorobanResultExists — finality pre-check query", () => {
   it("returns null when the RPC call itself fails", async () => {
     mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #3)"));
     const result = await sorobanResultExists(makeConfig(), "ballot-d");
+    expect(result).toBeNull();
+  });
+});
+
+describe("sorobanVerifyResultProof", () => {
+  const dummyProof = {
+    vote_hash: "00".repeat(32),
+    path: ["11".repeat(32)],
+    index: 0,
+  };
+
+  it("returns true when proof verifies successfully", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess(true));
+    const result = await sorobanVerifyResultProof(makeConfig(), "ballot-1", dummyProof, "result-hash");
+    expect(result).toBe(true);
+  });
+
+  it("returns false when proof verification fails", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationSuccess(false));
+    const result = await sorobanVerifyResultProof(makeConfig(), "ballot-1", dummyProof, "result-hash");
+    expect(result).toBe(false);
+  });
+
+  it("returns null when contract ID is invalid without calling RPC", async () => {
+    const result = await sorobanVerifyResultProof(
+      makeConfig({ contractId: "invalid-id" }),
+      "ballot-1",
+      dummyProof,
+      "result-hash",
+    );
+    expect(result).toBeNull();
+    expect(mockRpc.simulateTransaction).not.toHaveBeenCalled();
+  });
+
+  it("returns null when RPC simulation fails (e.g., BallotNotFound)", async () => {
+    mockRpc.simulateTransaction.mockResolvedValueOnce(simulationError("Error(Contract, #4)"));
+    const result = await sorobanVerifyResultProof(makeConfig(), "ballot-1", dummyProof, "result-hash");
     expect(result).toBeNull();
   });
 });
