@@ -1207,6 +1207,20 @@ mod tests {
         };
         assert!(client.verify_result_proof(&ballot, &proof1, &root_hex));
 
+        // Verify valid proof for a single-node tree (empty path, leaf is root)
+        let single_root_hex = bytes_to_hex(&env, &leaf0);
+        let ballot_single = String::from_str(&env, "single-node-ballot");
+        client.record_ballot(&admin, &ballot_single, &limits(10, 10));
+        let op_id_single = client.record_result(&admin, &ballot_single, &single_root_hex);
+        client.approve_operation(&op_id_single, &admin);
+
+        let proof_single = MerkleProof {
+            vote_hash: leaf0.clone(),
+            path: Vec::new(&env),
+            index: 0,
+        };
+        assert!(client.verify_result_proof(&ballot_single, &proof_single, &single_root_hex));
+
         // Verify invalid proof: invalid vote hash
         let invalid_vote_proof = MerkleProof {
             vote_hash: BytesN::from_array(&env, &[0u8; 32]),
